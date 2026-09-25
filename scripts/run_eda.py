@@ -68,17 +68,21 @@ def sampling_banner(cfg) -> str:
     fast = bool(cfg.eda.get("fast_mode", False))
     order = ["n_positive_s1", "max_positive_pairs", "n_negative_match_anchors",
              "n_negative_singleton_anchors", "retrieval_pool_sample", "n_blocking_s1",
-             "blocking_pool_sample", "country_shift_per_group", "collision_aggressive_sample"]
+             "blocking_pool_sample", "country_shift_per_group", "collision_aggressive_sample",
+             "transliteration_sample"]
     sizes = ", ".join(f"{k}={sampling.get(k, 'NA')}" for k in order if k in sampling)
     lines = [
         "",
         "==== SAMPLING & SCALE (Stage 1) ====",
         f"fast_mode: {fast}",
         "FULL-data : audit, ground-truth counts, raw+conservative collisions,",
-        "            country counts + missing rates",
+        "            country counts + missing rates, script distribution,",
+        "            char-stat denominators",
         "SAMPLED   : positive features, hard negatives, aggressive collisions,",
-        "            blocking, graph (on blocking union), vocab overlap",
+        "            blocking, graph (on blocking union), vocab overlap,",
+        "            transliteration collisions, char stats, pair-level multilingual",
         f"sizes     : {sizes or 'NA'}",
+        f"translit  : {((cfg.eda.get('multilingual', {}) or {}).get('transliteration_backend', 'auto'))}",
         "closed world: sampled pools are FORCED to contain anchor truth",
         "====================================",
         "",

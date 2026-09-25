@@ -6,9 +6,12 @@ Every function below produces CSV artifacts under ``eda/``, figures under
 
 Scale rework (7.6M pairs must never materialize):
   FULL-data: audit, ground-truth counts (vectorized), raw + conservative
-    collisions, country counts / missing rates.
+    collisions, country counts / missing rates, script distribution (11),
+    character-stat denominators (14).
   SAMPLED: positive features, hard negatives, blocking, graph, vocab overlap,
-    aggressive-norm collisions. Every sampled artifact records its sample size;
+    aggressive-norm collisions, transliteration collisions (12), character
+    stats (14), cross-script positives (13), token audit (15), char-n-gram
+    comparison (16). Every sampled artifact records its sample size;
     ``reports/eda_summary.md`` discloses full vs sampled.
 
 Sections:
@@ -20,7 +23,14 @@ Sections:
     6. run_country_shift_eda (sampled)   -> 08_country_shift_report.csv
     7. run_graph_diagnostics (sampled)   -> 09_candidate_graph_diagnostics.csv
     8. build_casebook                    -> 10_casebook_train_pairs.html
-    9. generate_summary_md               -> reports/eda_summary.md
+    9. multilingual EDA (§28)            -> 11_script_distribution.csv,
+                                            12_transliteration_collision_report.csv,
+                                            13_cross_script_positive_pairs.csv,
+                                            14_character_statistics.csv,
+                                            15_token_assumption_audit.csv,
+                                            16_char_ngram_comparison.csv
+                                            (+ 4 figures; FULL: 11 + 14 denominators)
+   10. generate_summary_md               -> reports/eda_summary.md
 
 Determinism: all sampling uses ``np.random.RandomState(cfg seed)``.
 Offline: matplotlib Agg backend (headless-safe); seaborn optional.
@@ -32,6 +42,7 @@ import gc
 import html
 import logging
 import math
+import time
 import zlib
 from collections import Counter
 from pathlib import Path
@@ -48,17 +59,30 @@ from .config import AppConfig
 from .features import (
     FEATURE_COLUMNS,
     add_pair_features,
+    fuzz_ratio,
     summarize_feature_frame,
 )
 from .io import anchor_truth_to_basic, ground_truth_stats, parse_anchor_truth
 from .normalization import (
     BUSINESS_TYPE_TOKENS,
+    EN_STOPWORDS_MEASURE,
+    INDIC_SUFFIX_TOKENS,
     LEGAL_SUFFIX_TOKENS,
+    SCRIPT_CATEGORIES,
+    SCRIPT_REGEX,
+    char_ngram_jaccard,
+    char_ngram_set,
+    detect_script_category,
     extract_numeric_tokens,
+    jaccard_similarity,
     normalize_aggressive,
     normalize_basic,
+    pair_script_bucket,
+    resolve_transliteration_backend,
     string_stats,
     tokenize,
+    transliterate_text,
+    word_jaccard,
 )
 
 logger = logging.getLogger("ber")
@@ -2158,11 +2182,936 @@ def run_country_shift_eda(
 # 9. CASEBOOK -> 10_casebook_train_pairs.html
 # ===========================================================================
 
+# ===========================================================================
+# 11. MULTILINGUAL / MULTI-SCRIPT EDA (§28) -> 11_*, 12_*, 13_*, 14_*, 15_*, 16_*
+# ===========================================================================
+#
+# Approach: keep MULTIPLE representations side by side and compare their
+# behavior on the SAME sampled data — (a) raw (authoritative, never
+# overwritten), (b) unicode-norm (NFKC), (c) conservative script-aware norm
+# (normalize_basic, Unicode-preserving), (d) transliteration (ADDITIONAL
+# feature only, never canonical), (e) character-level (stats + n-grams).
+# Transliteration is judged by its recall-vs-risk tradeoff and is NEVER
+# assumed beneficial just because it creates more matches.
+
+_NONASCII_RE = r"[^\x00-\x7F]"
+_SCRIPT_PLOT_COLORS = {
+    "Latin": "#4C78A8",
+    "Devanagari": "#F58518",
+    "Cyrillic": "#54A24B",
+    "Arabic": "#E45756",
+    "mixed": "#79706E",
+    "other Unicode": "#BAB0AC",
+    "empty/missing": "#DCDCDC",
+}
+_ML_TABLE_ORDER = ("train_s1", "train_s2", "train_s3", "test_s1", "test_s2", "test_s3")
+_ML_TABLE_LABELS = {
+    "train_s1": "train_source1", "train_s2": "train_source2",
+    "train_s3": "train_source3", "test_s1": "test_source1",
+    "test_s2": "test_source2", "test_s3": "test_source3",
+}
+_ML_PAIR_COLUMNS = (
+    "s1_name_script", "cand_name_script", "name_script_bucket",
+    "translit_name_agree_exact", "translit_name_ratio", "translit_addr_ratio",
+)
+_HARD_NEG_TYPES = ("name_hard", "address_hard", "hybrid_hard")
+
+
+def _multilingual_cfg(cfg: AppConfig) -> Dict[str, Any]:
+    return dict(cfg.eda.get("multilingual", {}) or {})
+
+
+def _script_category_series(values: pd.Series) -> pd.Series:
+    """Vectorized script categories (C-speed regex; mirrors per-row detect).
+
+    Missing values (-> "") become "empty/missing"; pure digit/punct ASCII
+    becomes "Latin" (documented scriptless rule). Never raises on odd input.
+    """
+    s = values.fillna("").astype(str)
+    if s.empty:
+        return pd.Series([], dtype=object, index=values.index)
+    blank = (s.str.strip() == "").to_numpy()
+    nonascii = s.str.contains(_NONASCII_RE, regex=True, na=False).to_numpy()
+    has_latin = s.str.contains(SCRIPT_REGEX["Latin"], regex=True, na=False).to_numpy()
+    has_deva = s.str.contains(SCRIPT_REGEX["Devanagari"], regex=True, na=False).to_numpy()
+    has_cyrl = s.str.contains(SCRIPT_REGEX["Cyrillic"], regex=True, na=False).to_numpy()
+    has_arab = s.str.contains(SCRIPT_REGEX["Arabic"], regex=True, na=False).to_numpy()
+    has_other = s.str.contains(SCRIPT_REGEX["other"], regex=True, na=False).to_numpy()
+    n = (has_latin.astype(np.int8) + has_deva.astype(np.int8)
+         + has_cyrl.astype(np.int8) + has_arab.astype(np.int8)
+         + has_other.astype(np.int8))
+    cats = np.select(
+        [
+            blank,
+            n >= 2,
+            has_latin & (n == 1),
+            has_deva & (n == 1),
+            has_cyrl & (n == 1),
+            has_arab & (n == 1),
+            has_other & (n == 1),
+            (n == 0) & ~nonascii,
+        ],
+        [
+            "empty/missing", "mixed", "Latin", "Devanagari", "Cyrillic",
+            "Arabic", "other Unicode", "Latin",
+        ],
+        default="other Unicode",
+    )
+    return pd.Series(cats, index=values.index)
+
+
+# ---------------------------------------------------------------------------
+# 11. Script distribution (FULL data) -> 11_script_distribution.csv
+# ---------------------------------------------------------------------------
+
+def run_script_distribution_eda(
+    tables: Dict[str, Optional[pd.DataFrame]],
+    cfg: AppConfig,
+) -> Dict[str, Any]:
+    """FULL-data script mix per source x field (+ stacked figure)."""
+    cols = cfg.columns
+    c_name, c_addr = cols["business_name"], cols["business_address"]
+    fields = ((c_name, "business_name"), (c_addr, "business_address"))
+    rows: List[Dict[str, object]] = []
+    for key in _ML_TABLE_ORDER:
+        df = (tables or {}).get(key)
+        if df is None or df.empty:
+            continue
+        n = len(df)
+        for col, field in fields:
+            if col not in df.columns:
+                continue
+            cats = _script_category_series(df[col])
+            vc = cats.value_counts()
+            for cat in SCRIPT_CATEGORIES:
+                cnt = int(vc.get(cat, 0))
+                rows.append({
+                    "source": _ML_TABLE_LABELS[key],
+                    "field": field,
+                    "script_category": cat,
+                    "row_count": cnt,
+                    "percentage": round(cnt / n, 6) if n else 0.0,
+                })
+            del cats
+        gc.collect()
+    report = pd.DataFrame(
+        rows,
+        columns=["source", "field", "script_category", "row_count", "percentage"],
+    )
+    out_csv = cfg.eda_dir / "11_script_distribution.csv"
+    report.to_csv(out_csv, index=False)
+    artifacts = [str(out_csv)]
+
+    # figure: stacked percentage bars per source, one panel per field
+    _apply_style(cfg)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), sharey=True)
+    for ax, field in zip(axes, ("business_name", "business_address")):
+        sub = report[report.field == field]
+        sources = [s for s in
+                   ("train_source1", "train_source2", "train_source3",
+                    "test_source1", "test_source2", "test_source3")
+                   if s in set(sub.source.tolist())]
+        bottom = np.zeros(len(sources))
+        plotted = False
+        for cat in SCRIPT_CATEGORIES:
+            vals = np.array([
+                float(sub[(sub.source == s) & (sub.script_category == cat)]["percentage"].sum())
+                for s in sources
+            ])
+            if (vals > 0).any():
+                plotted = True
+            ax.bar(sources, vals * 100.0, bottom=bottom,
+                   label=cat, color=_SCRIPT_PLOT_COLORS.get(cat))
+            bottom = bottom + vals * 100.0
+        ax.set_title(f"Script mix: {field} (FULL data)")
+        ax.set_ylabel("% of rows")
+        ax.set_xticklabels(sources, rotation=25, ha="right")
+        if not plotted:
+            ax.text(0.5, 0.5, "no data", ha="center", transform=ax.transAxes)
+    fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.06))
+    fig.tight_layout()
+    artifacts.append(_savefig(fig, cfg.figures_dir / "script_distribution.png", cfg))
+
+    # non-Latin share among ALL rows per source x field (for the summary:
+    # what a Latin-only approach could not even see)
+    non_latin_rates: Dict[str, Dict[str, float]] = {}
+    non_latin_cats = {"Devanagari", "Cyrillic", "Arabic", "mixed", "other Unicode"}
+    for (source, field), grp in report.groupby(["source", "field"]):
+        share = float(grp[grp.script_category.isin(non_latin_cats)]["percentage"].sum())
+        non_latin_rates.setdefault(str(source), {})[str(field)] = round(share, 6)
+    return {
+        "script_csv": str(out_csv),
+        "artifacts": artifacts,
+        "non_latin_rates": non_latin_rates,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 14. Character-level statistics (FULL n + FULL non-ASCII rates; SAMPLED rest)
+# ---------------------------------------------------------------------------
+
+def _extended_char_stats(text: str) -> Dict[str, float]:
+    n = len(text)
+    n_alpha = sum(1 for ch in text if ch.isalpha())
+    n_digit = sum(1 for ch in text if ch.isdigit())
+    n_space = sum(1 for ch in text if ch.isspace())
+    n_punct = n - n_alpha - n_digit - n_space  # remainder partition
+    return {
+        "len": float(n),
+        "alpha": float(n_alpha),
+        "digit": float(n_digit),
+        "punct": float(n_punct),
+        "space": float(n_space),
+    }
+
+
+def run_character_stats_eda(
+    train: Dict[str, Optional[pd.DataFrame]],
+    test: Dict[str, Optional[pd.DataFrame]],
+    cfg: AppConfig,
+) -> Dict[str, Any]:
+    """Per table x country: FULL n + non-ASCII rates; SAMPLED char stats.
+
+    Also records sampled script shares and lowercase char-3-gram vocabulary
+    sizes so S1/S2/S3 and train/test can be compared on representation load.
+    """
+    cols = cfg.columns
+    c_name, c_addr, c_cty = cols["business_name"], cols["business_address"], cols["country"]
+    per_group = int(_sampling_cfg(cfg).get("country_shift_per_group", 20000))
+    tables: List[Tuple[str, Optional[pd.DataFrame]]] = [
+        ("train_source1", (train or {}).get("train_s1")),
+        ("train_source2", (train or {}).get("train_s2")),
+        ("train_source3", (train or {}).get("train_s3")),
+        ("test_source1", (test or {}).get("test_s1")),
+        ("test_source2", (test or {}).get("test_s2")),
+        ("test_source3", (test or {}).get("test_s3")),
+    ]
+    rows: List[Dict[str, object]] = []
+    actual: Dict[str, int] = {}
+    for table_idx, (label, df) in enumerate(tables):
+        if df is None or df.empty:
+            continue
+        if c_name not in df.columns and c_addr not in df.columns:
+            logger.warning("Character-stats EDA skipping %s (no name/address columns).", label)
+            continue
+        name_s = df[c_name].fillna("").astype(str) if c_name in df.columns else pd.Series([""] * len(df))
+        addr_s = df[c_addr].fillna("").astype(str) if c_addr in df.columns else pd.Series([""] * len(df))
+        if c_cty in df.columns:
+            cty_s = df[c_cty].fillna("").astype(str)
+        else:
+            cty_s = pd.Series(["__missing_country_column__"] * len(df))
+        counts = cty_s.value_counts()
+        # FULL-data non-ASCII rates per country (vectorized groupby)
+        try:
+            name_na = name_s.str.contains(_NONASCII_RE, regex=True, na=False).groupby(cty_s).mean()
+            addr_na = addr_s.str.contains(_NONASCII_RE, regex=True, na=False).groupby(cty_s).mean()
+        except Exception:
+            name_na = addr_na = pd.Series(dtype=float)
+        for country in sorted(counts.index.tolist()):
+            n_full = int(counts.loc[country])
+            mask = (cty_s == country).to_numpy()
+            positions = np.flatnonzero(mask)
+            rng = _rng(cfg, salt=_stable_salt(cfg, f"chstats::{label}::{country}", base=800 + table_idx))
+            if len(positions) > per_group:
+                sel = np.sort(rng.choice(positions, per_group, replace=False))
+            else:
+                sel = positions
+            samp_names = name_s.iloc[sel]
+            samp_addrs = addr_s.iloc[sel]
+            name_scripts = _script_category_series(samp_names).value_counts(normalize=True)
+            addr_scripts = _script_category_series(samp_addrs).value_counts(normalize=True)
+            n_len = a_len = n_alpha = n_digit = n_punct = n_space = 0.0
+            a_alpha = a_digit = a_punct = a_space = 0.0
+            name_chars: Set[str] = set()
+            addr_chars: Set[str] = set()
+            name_tri: Set[str] = set()
+            addr_tri: Set[str] = set()
+            for val in samp_names.tolist():
+                st = _extended_char_stats(val)
+                n_len += st["len"]; n_alpha += st["alpha"]; n_digit += st["digit"]
+                n_punct += st["punct"]; n_space += st["space"]
+                name_chars.update(val)
+                name_tri.update(char_ngram_set(val.lower(), (3,)))
+            for val in samp_addrs.tolist():
+                st = _extended_char_stats(val)
+                a_len += st["len"]; a_alpha += st["alpha"]; a_digit += st["digit"]
+                a_punct += st["punct"]; a_space += st["space"]
+                addr_chars.update(val)
+                addr_tri.update(char_ngram_set(val.lower(), (3,)))
+            m = float(len(sel)) or 1.0
+            script_cols: Dict[str, object] = {}
+            for prefix, shares in (("name", name_scripts), ("addr", addr_scripts)):
+                script_cols[f"{prefix}_latin_share"] = round(float(shares.get("Latin", 0.0)), 6)
+                script_cols[f"{prefix}_deva_share"] = round(float(shares.get("Devanagari", 0.0)), 6)
+                script_cols[f"{prefix}_cyrl_share"] = round(float(shares.get("Cyrillic", 0.0)), 6)
+                script_cols[f"{prefix}_arab_share"] = round(float(shares.get("Arabic", 0.0)), 6)
+                script_cols[f"{prefix}_mixed_share"] = round(float(shares.get("mixed", 0.0)), 6)
+                script_cols[f"{prefix}_other_share"] = round(float(shares.get("other Unicode", 0.0)), 6)
+            rows.append({
+                "table": label,
+                "country": country,
+                "n": n_full,
+                "n_sampled": int(len(sel)),
+                "name_nonascii_rate": round(float(name_na.get(country, 0.0)), 6),
+                "addr_nonascii_rate": round(float(addr_na.get(country, 0.0)), 6),
+                "name_len_mean": round(n_len / m, 3),
+                "addr_len_mean": round(a_len / m, 3),
+                "name_alpha_mean": round(n_alpha / m, 3),
+                "name_digit_mean": round(n_digit / m, 3),
+                "name_punct_mean": round(n_punct / m, 3),
+                "name_space_mean": round(n_space / m, 3),
+                "addr_alpha_mean": round(a_alpha / m, 3),
+                "addr_digit_mean": round(a_digit / m, 3),
+                "addr_punct_mean": round(a_punct / m, 3),
+                "addr_space_mean": round(a_space / m, 3),
+                "name_unique_chars": len(name_chars),
+                "addr_unique_chars": len(addr_chars),
+                **script_cols,
+                "name_trigram_vocab": len(name_tri),
+                "addr_trigram_vocab": len(addr_tri),
+            })
+            actual[f"{label}::{country}"] = int(len(sel))
+        del name_s, addr_s, cty_s
+        gc.collect()
+    columns = [
+        "table", "country", "n", "n_sampled",
+        "name_nonascii_rate", "addr_nonascii_rate",
+        "name_len_mean", "addr_len_mean",
+        "name_alpha_mean", "name_digit_mean", "name_punct_mean", "name_space_mean",
+        "addr_alpha_mean", "addr_digit_mean", "addr_punct_mean", "addr_space_mean",
+        "name_unique_chars", "addr_unique_chars",
+        "name_latin_share", "name_deva_share", "name_cyrl_share", "name_arab_share",
+        "name_mixed_share", "name_other_share",
+        "addr_latin_share", "addr_deva_share", "addr_cyrl_share", "addr_arab_share",
+        "addr_mixed_share", "addr_other_share",
+        "name_trigram_vocab", "addr_trigram_vocab",
+    ]
+    report = pd.DataFrame(rows, columns=columns)
+    if not report.empty:
+        report = report.sort_values(["table", "country"]).reset_index(drop=True)
+    out_csv = cfg.eda_dir / "14_character_statistics.csv"
+    report.to_csv(out_csv, index=False)
+    return {
+        "char_stats_csv": str(out_csv),
+        "artifacts": [str(out_csv)],
+        "per_group_config": int(per_group),
+        "actual": dict(actual),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 12. Transliteration collision study (SAMPLED, fair raw/norm/translit)
+# ---------------------------------------------------------------------------
+
+def run_transliteration_collision_eda(
+    tables: Dict[str, Optional[pd.DataFrame]],
+    cfg: AppConfig,
+) -> Dict[str, Any]:
+    """Compare raw vs conservative-norm vs transliterated on ONE sample.
+
+    All three representations share the same sampled rows per table, so
+    uniqueness differences are representation effects, not sampling effects.
+    Counts cross-script collision groups (same value, mixed source scripts)
+    as the false-merge risk of each representation. Transliteration is one
+    more representation here — never canonical.
+    """
+    cols = cfg.columns
+    c_name, c_addr = cols["business_name"], cols["business_address"]
+    backend = resolve_transliteration_backend(
+        _multilingual_cfg(cfg).get("transliteration_backend", "auto"))
+    sample_n = int(_sampling_cfg(cfg).get("transliteration_sample", 500000))
+    if backend == "none":
+        logger.warning("Transliteration backend is 'none' — writing raw/norm sample rows only.")
+    rows: List[Dict[str, object]] = []
+    largest_cross: Dict[str, Any] = {}
+    cluster_sizes: Dict[str, Dict[str, np.ndarray]] = {}
+    actual: Dict[str, int] = {}
+    for table_idx, key in enumerate(_ML_TABLE_ORDER):
+        df = (tables or {}).get(key)
+        if df is None or df.empty:
+            continue
+        if c_name not in df.columns or c_addr not in df.columns:
+            logger.warning("Transliteration-collision EDA skipping %s (missing columns).", key)
+            continue
+        n = len(df)
+        rng = _rng(cfg, salt=701 + table_idx)
+        if n > sample_n:
+            idx = sorted(rng.choice(n, sample_n, replace=False).tolist())
+        else:
+            idx = list(range(n))
+        label = _ML_TABLE_LABELS[key]
+        raw_name = df[c_name].fillna("").astype(str).iloc[idx]
+        raw_addr = df[c_addr].fillna("").astype(str).iloc[idx]
+        name_scripts = _script_category_series(raw_name)
+        addr_scripts = _script_category_series(raw_addr)
+        actual[label] = int(len(raw_name))
+        reps: List[Tuple[str, Optional[pd.Series], pd.Series]] = [
+            ("raw_name", raw_name, name_scripts),
+            ("norm_name", raw_name.map(normalize_basic), name_scripts),
+            ("raw_address", raw_addr, addr_scripts),
+            ("norm_address", raw_addr.map(normalize_basic), addr_scripts),
+        ]
+        if backend != "none":
+            reps.append(("translit_name",
+                         raw_name.map(lambda s: transliterate_text(s, backend)),
+                         name_scripts))
+            reps.append(("translit_address",
+                         raw_addr.map(lambda s: transliterate_text(s, backend)),
+                         addr_scripts))
+        for rep_name, vals, scripts in reps:
+            assert vals is not None
+            st = _collision_stats(vals)
+            n_empty = int((vals == "").sum())
+            # Cross-script groups: identical value from >= 2 script buckets.
+            # (raw rows always score 0 — identical strings share one bucket —
+            # but we compute uniformly for a fair table.)
+            n_cross, largest_cross_size = 0, 0
+            try:
+                frame = pd.DataFrame({"v": vals.to_numpy(), "s": scripts.to_numpy()})
+                grp = frame.groupby("v")["s"]
+                sizes = grp.size()
+                nunique = grp.nunique()
+                mask = (sizes > 1) & (nunique > 1)
+                n_cross = int(mask.sum())
+                if n_cross:
+                    largest_cross_size = int(sizes[mask].max())
+                    if rep_name.startswith("translit_"):
+                        top = sizes[mask].sort_values(ascending=False).head(3)
+                        examples = []
+                        for val_key, size in top.items():
+                            mix = sorted(frame.loc[frame.v == val_key, "s"].unique().tolist())
+                            examples.append({
+                                "value_preview": str(val_key)[:80],
+                                "size": int(size),
+                                "scripts": mix,
+                            })
+                        largest_cross.setdefault(label, {})[rep_name] = examples
+            except Exception as exc:
+                logger.warning("Cross-script grouping failed for %s/%s: %s", label, rep_name, exc)
+            rows.append({
+                "table": label,
+                "representation": rep_name,
+                "backend": backend,
+                "n_records": st["n_records"],
+                "n_unique": st["n_unique"],
+                "pct_unique": st["pct_unique"],
+                "n_collision_groups": st["n_collision_groups"],
+                "largest_cluster": st["largest_cluster"],
+                "mean_cluster_size": st["mean_cluster_size"],
+                "n_empty": n_empty,
+                "n_cross_script_groups": n_cross,
+                "largest_cross_script_group": largest_cross_size,
+            })
+            vc = vals.value_counts()
+            groups = vc[vc > 1]
+            cluster_sizes.setdefault(key, {})[rep_name] = (
+                groups.to_numpy(dtype=float) if len(groups) else np.array([]))
+        del raw_name, raw_addr, name_scripts, addr_scripts
+        gc.collect()
+    report = pd.DataFrame(
+        rows,
+        columns=["table", "representation", "backend", "n_records", "n_unique",
+                 "pct_unique", "n_collision_groups", "largest_cluster",
+                 "mean_cluster_size", "n_empty", "n_cross_script_groups",
+                 "largest_cross_script_group"],
+    )
+    out_csv = cfg.eda_dir / "12_transliteration_collision_report.csv"
+    report.to_csv(out_csv, index=False)
+    artifacts = [str(out_csv)]
+
+    # figure: pooled train collision-size ECDFs (raw vs norm vs translit)
+    _apply_style(cfg)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.4), sharey=True)
+    rep_sets = (
+        ("raw_name", "norm_name", "translit_name"),
+        ("raw_address", "norm_address", "translit_address"),
+    )
+    for ax, rep_set in zip(axes, rep_sets):
+        plotted = False
+        for rep in rep_set:
+            pooled = np.concatenate([
+                cluster_sizes.get(k, {}).get(rep, np.array([]))
+                for k in ("train_s1", "train_s2", "train_s3")
+            ]) if any(len(cluster_sizes.get(k, {}).get(rep, []))
+                       for k in ("train_s1", "train_s2", "train_s3")) else np.array([])
+            pooled = pooled[pooled > 1]
+            if len(pooled):
+                x, y = _ecdf(np.log10(pooled))
+                ax.plot(x, y, label=f"{rep} (n={len(pooled)})")
+                plotted = True
+        ax.set_title(f"Collision sizes (train pooled): {rep_set[0].split('_')[-1]}")
+        ax.set_xlabel("log10(cluster size)")
+        if not plotted:
+            ax.text(0.5, 0.5, "no collisions", ha="center", transform=ax.transAxes)
+    axes[0].set_ylabel("ECDF")
+    fig.legend(loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.02))
+    artifacts.append(_savefig(
+        fig, cfg.figures_dir / "transliteration_collision_sizes.png", cfg))
+
+    per_table: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for (table, rep), grp in report.groupby(["table", "representation"]):
+        per_table.setdefault(str(table), {})[str(rep)] = {
+            "n_unique": float(grp["n_unique"].iloc[0]),
+            "n_collision_groups": float(grp["n_collision_groups"].iloc[0]),
+            "n_cross_script_groups": float(grp["n_cross_script_groups"].iloc[0]),
+            "largest_cross_script_group": float(grp["largest_cross_script_group"].iloc[0]),
+        }
+    return {
+        "translit_csv": str(out_csv),
+        "artifacts": artifacts,
+        "backend": backend,
+        "sample_config": int(sample_n),
+        "sample_actual": dict(actual),
+        "per_table": per_table,
+        "largest_cross_script_examples": largest_cross,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared pair annotation for §28.5-§28.8 (sampled pairs only, in place)
+# ---------------------------------------------------------------------------
+
+def _ensure_multilingual_pair_columns(
+    df: Optional[pd.DataFrame],
+    cfg: AppConfig,
+) -> Optional[pd.DataFrame]:
+    """Add script + transliteration-agreement columns to a pair frame.
+
+    Mutates in place (shared across sections 13/15/16 + casebook so the work
+    happens once). No-op on empty frames or when columns already exist.
+    Transliteration here is an agreement MEASURE on raw strings, never a
+    replacement representation.
+    """
+    if df is None or df.empty:
+        return df
+    if all(c in df.columns for c in _ML_PAIR_COLUMNS):
+        return df
+    backend = resolve_transliteration_backend(
+        _multilingual_cfg(cfg).get("transliteration_backend", "auto"))
+    get = lambda c: df[c].fillna("").astype(str) if c in df.columns else pd.Series([""] * len(df))
+    s1_raw, cand_raw = get("s1_name_raw"), get("cand_name_raw")
+    s1_addr, cand_addr = get("s1_addr_raw"), get("cand_addr_raw")
+    s1_script = _script_category_series(s1_raw)
+    cand_script = _script_category_series(cand_raw)
+    df["s1_name_script"] = s1_script.to_numpy()
+    df["cand_name_script"] = cand_script.to_numpy()
+    df["name_script_bucket"] = [
+        pair_script_bucket(a, b) for a, b in zip(s1_script.tolist(), cand_script.tolist())
+    ]
+    t_s1 = s1_raw.map(lambda s: transliterate_text(s, backend))
+    t_cand = cand_raw.map(lambda s: transliterate_text(s, backend))
+    agree = ((t_s1.str.lower() == t_cand.str.lower()) & (t_s1 != "") & (t_cand != ""))
+    df["translit_name_agree_exact"] = agree.astype(float).to_numpy()
+    df["translit_name_ratio"] = np.array(
+        [fuzz_ratio(a, b) for a, b in zip(t_s1.tolist(), t_cand.tolist())], dtype=float)
+    if backend == "none":
+        df["translit_addr_ratio"] = np.zeros(len(df), dtype=float)
+    else:
+        t_s1a = s1_addr.map(lambda s: transliterate_text(s, backend))
+        t_canda = cand_addr.map(lambda s: transliterate_text(s, backend))
+        df["translit_addr_ratio"] = np.array(
+            [fuzz_ratio(a, b) for a, b in zip(t_s1a.tolist(), t_canda.tolist())], dtype=float)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 13. Cross-script positive-pair analysis (SAMPLED positives)
+# ---------------------------------------------------------------------------
+
+_CROSS_SCRIPT_BUCKETS = ("cross_latin_deva", "cross_other")
+
+def run_cross_script_positive_eda(
+    pos_feat: Optional[pd.DataFrame],
+    cfg: AppConfig,
+) -> Dict[str, Any]:
+    """Where do cross-script positives live, and does translit agree?"""
+    columns = ["source_pair", "s1_country", "cand_country", "s1_script",
+               "cand_script", "n_pairs", "pct_of_source_pair",
+               "translit_exact_rate", "translit_ratio_p50",
+               "name_exact_rate", "name_ratio_p50"]
+    pos_feat = _ensure_multilingual_pair_columns(pos_feat, cfg)
+    out_csv = cfg.eda_dir / "13_cross_script_positive_pairs.csv"
+    if pos_feat is None or pos_feat.empty or "source_pair" not in pos_feat.columns:
+        pd.DataFrame(columns=columns).to_csv(out_csv, index=False)
+        return {"xscript_csv": str(out_csv), "artifacts": [str(out_csv)],
+                "n_pairs": 0, "cross_script_rate": 0.0,
+                "nonlatin_involved_rate": 0.0, "same_after_translit_rate": 0.0,
+                "by_source_pair": {}}
+    grp = pos_feat.groupby(["source_pair", "s1_country", "cand_country",
+                            "s1_name_script", "cand_name_script"], dropna=False)
+    pair_totals = pos_feat.groupby("source_pair").size().to_dict()
+    rows: List[Dict[str, object]] = []
+    for keys, sub in grp:
+        sp = str(keys[0])
+        rows.append({
+            "source_pair": sp,
+            "s1_country": "" if pd.isna(keys[1]) else str(keys[1]),
+            "cand_country": "" if pd.isna(keys[2]) else str(keys[2]),
+            "s1_script": str(keys[3]),
+            "cand_script": str(keys[4]),
+            "n_pairs": int(len(sub)),
+            "pct_of_source_pair": round(len(sub) / pair_totals.get(keys[0], len(sub)), 6),
+            "translit_exact_rate": round(float(sub["translit_name_agree_exact"].mean()), 6),
+            "translit_ratio_p50": round(float(sub["translit_name_ratio"].median()), 6),
+            "name_exact_rate": round(float(sub["name_exact"].mean()), 6)
+            if "name_exact" in sub.columns else 0.0,
+            "name_ratio_p50": round(float(sub["name_ratio"].median()), 6)
+            if "name_ratio" in sub.columns else 0.0,
+        })
+    report = pd.DataFrame(rows, columns=columns)
+    report = report.sort_values(["source_pair", "n_pairs"],
+                                ascending=[True, False]).reset_index(drop=True)
+    report.to_csv(out_csv, index=False)
+    n = len(pos_feat)
+    by_pair: Dict[str, Dict[str, float]] = {}
+    for sp, sub in pos_feat.groupby("source_pair"):
+        cross = sub["name_script_bucket"].isin(_CROSS_SCRIPT_BUCKETS).mean()
+        by_pair[str(sp)] = {
+            "n": int(len(sub)),
+            "cross_script_rate": round(float(cross), 6),
+            "translit_exact_rate": round(float(sub["translit_name_agree_exact"].mean()), 6),
+        }
+    return {
+        "xscript_csv": str(out_csv),
+        "artifacts": [str(out_csv)],
+        "n_pairs": int(n),
+        "cross_script_rate": round(
+            float(pos_feat["name_script_bucket"].isin(_CROSS_SCRIPT_BUCKETS).mean()), 6),
+        "nonlatin_involved_rate": round(float(
+            ((pos_feat["s1_name_script"] != "Latin")
+             | (pos_feat["cand_name_script"] != "Latin")).mean()), 6),
+        "same_after_translit_rate": round(
+            float(pos_feat["translit_name_agree_exact"].mean()), 6),
+        "by_source_pair": by_pair,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 15. English-token assumption audit (SAMPLED positives + negatives)
+# ---------------------------------------------------------------------------
+
+def _suffix_shared_flags(
+    s1_norm: pd.Series, cand_norm: pd.Series
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per-pair word-Jaccard + suffix/stopword overlap flags (measure only)."""
+    word_jac = np.zeros(len(s1_norm), dtype=float)
+    en_suffix = np.zeros(len(s1_norm), dtype=float)
+    en_stop = np.zeros(len(s1_norm), dtype=float)
+    indic_suffix = np.zeros(len(s1_norm), dtype=float)
+    stopword_only = np.zeros(len(s1_norm), dtype=float)
+    s1_list = s1_norm.fillna("").astype(str).tolist()
+    cand_list = cand_norm.fillna("").astype(str).tolist()
+    for i, (a, b) in enumerate(zip(s1_list, cand_list)):
+        set_a = set(tokenize(a))
+        set_b = set(tokenize(b))
+        word_jac[i] = jaccard_similarity(set_a, set_b)
+        overlap = set_a & set_b
+        if not overlap:
+            continue
+        if overlap & LEGAL_SUFFIX_TOKENS:
+            en_suffix[i] = 1.0
+        if overlap & EN_STOPWORDS_MEASURE:
+            en_stop[i] = 1.0
+        if overlap & INDIC_SUFFIX_TOKENS:
+            indic_suffix[i] = 1.0
+        if overlap <= EN_STOPWORDS_MEASURE:
+            stopword_only[i] = 1.0
+    return word_jac, en_suffix, en_stop, indic_suffix, stopword_only
+
+
+def run_token_assumption_audit_eda(
+    pos_feat: Optional[pd.DataFrame],
+    negs_feat: Optional[pd.DataFrame],
+    cfg: AppConfig,
+) -> Dict[str, Any]:
+    """How do token-based features behave per script bucket and class?
+
+    Measures word-Jaccard, token_set_ratio, suffix sharing (English legal
+    suffixes AND Indic suffix candidates — both measure-only, never
+    stripped, never equated) and stopword-only overlap. No stopword removal
+    anywhere: this section audits what such removal would destroy.
+    """
+    columns = ["script_bucket", "class", "n", "word_jaccard_mean",
+               "word_jaccard_p50", "token_set_p50", "en_suffix_shared_rate",
+               "en_stopword_shared_rate", "indic_suffix_shared_rate",
+               "stopword_only_overlap_rate", "name_exact_rate"]
+    pos_feat = _ensure_multilingual_pair_columns(pos_feat, cfg)
+    negs_feat = _ensure_multilingual_pair_columns(negs_feat, cfg)
+    frames: List[Tuple[str, Optional[pd.DataFrame]]] = [("positive", pos_feat)]
+    if negs_feat is not None and not negs_feat.empty and "neg_type" in negs_feat.columns:
+        for neg_type, sub in negs_feat.groupby("neg_type"):
+            frames.append((str(neg_type), sub))
+    rows: List[Dict[str, object]] = []
+    for class_name, frame in frames:
+        if frame is None or frame.empty:
+            continue
+        wj, en_suf, en_stop, in_suf, sw_only = _suffix_shared_flags(
+            frame["s1_name_norm"] if "s1_name_norm" in frame.columns else pd.Series([""] * len(frame)),
+            frame["cand_name_norm"] if "cand_name_norm" in frame.columns else pd.Series([""] * len(frame)),
+        )
+        work = frame.copy()
+        work["_word_jaccard"] = wj
+        work["_en_suffix"] = en_suf
+        work["_en_stop"] = en_stop
+        work["_indic_suffix"] = in_suf
+        work["_sw_only"] = sw_only
+        for bucket, sub in work.groupby("name_script_bucket"):
+            rows.append({
+                "script_bucket": str(bucket),
+                "class": class_name,
+                "n": int(len(sub)),
+                "word_jaccard_mean": round(float(sub["_word_jaccard"].mean()), 6),
+                "word_jaccard_p50": round(float(sub["_word_jaccard"].median()), 6),
+                "token_set_p50": round(float(sub["name_token_set"].median()), 6)
+                if "name_token_set" in sub.columns else 0.0,
+                "en_suffix_shared_rate": round(float(sub["_en_suffix"].mean()), 6),
+                "en_stopword_shared_rate": round(float(sub["_en_stop"].mean()), 6),
+                "indic_suffix_shared_rate": round(float(sub["_indic_suffix"].mean()), 6),
+                "stopword_only_overlap_rate": round(float(sub["_sw_only"].mean()), 6),
+                "name_exact_rate": round(float(sub["name_exact"].mean()), 6)
+                if "name_exact" in sub.columns else 0.0,
+            })
+    report = pd.DataFrame(rows, columns=columns)
+    if not report.empty:
+        class_order = {c: i for i, c in enumerate(
+            ["positive", "name_hard", "address_hard", "hybrid_hard", "random"])}
+        report["_o"] = report["class"].map(lambda c: class_order.get(c, 99))
+        report = report.sort_values(["script_bucket", "_o"]).drop(columns="_o").reset_index(drop=True)
+    out_csv = cfg.eda_dir / "15_token_assumption_audit.csv"
+    report.to_csv(out_csv, index=False)
+    artifacts = [str(out_csv)]
+
+    # figure: word-Jaccard p50 + suffix-share rates by script bucket
+    _apply_style(cfg)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
+    buckets = sorted(report.script_bucket.unique().tolist()) if not report.empty else []
+    classes = [c for c in ("positive", "name_hard", "address_hard", "hybrid_hard", "random")
+               if c in set(report["class"].tolist())] if not report.empty else []
+    x = np.arange(len(buckets))
+    width = 0.8 / max(len(classes), 1)
+    for i, class_name in enumerate(classes):
+        vals = [float(report[(report.script_bucket == b) & (report["class"] == class_name)]
+                        ["word_jaccard_p50"].sum()) for b in buckets]
+        axes[0].bar(x + (i - len(classes) / 2 + 0.5) * width, vals, width, label=class_name)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(buckets, rotation=25, ha="right")
+    axes[0].set_title("word-Jaccard p50 by script bucket")
+    axes[0].set_ylabel("p50")
+    axes[0].legend(fontsize=8)
+    pos_only = report[report["class"] == "positive"] if not report.empty else report
+    x2 = np.arange(len(buckets))
+    for j, col in enumerate(("en_suffix_shared_rate", "indic_suffix_shared_rate")):
+        vals = [float(pos_only[pos_only.script_bucket == b][col].sum()) for b in buckets]
+        axes[1].bar(x2 + (j - 0.5) * 0.35, vals, 0.35, label=col)
+    axes[1].set_xticks(x2)
+    axes[1].set_xticklabels(buckets, rotation=25, ha="right")
+    axes[1].set_title("suffix sharing on positives (measure only)")
+    axes[1].set_ylabel("rate")
+    axes[1].legend(fontsize=8)
+    if report.empty:
+        axes[0].text(0.5, 0.5, "no data", ha="center", transform=axes[0].transAxes)
+    fig.tight_layout()
+    artifacts.append(_savefig(fig, cfg.figures_dir / "token_assumption_by_script.png", cfg))
+
+    headline: Dict[str, Any] = {}
+    for bucket in ("latin_latin", "deva_deva", "cross_latin_deva"):
+        sub = report[(report.script_bucket == bucket) & (report["class"] == "positive")]
+        if not sub.empty:
+            headline[bucket] = {
+                "n": int(sub["n"].iloc[0]),
+                "word_jaccard_p50": float(sub["word_jaccard_p50"].iloc[0]),
+                "token_set_p50": float(sub["token_set_p50"].iloc[0]),
+                "indic_suffix_shared_rate": float(sub["indic_suffix_shared_rate"].iloc[0]),
+            }
+    return {
+        "token_csv": str(out_csv),
+        "artifacts": artifacts,
+        "headline": headline,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 16. Character n-gram vs word-token comparison (SAMPLED pairs)
+# ---------------------------------------------------------------------------
+
+def _granularity_label(sizes: Tuple[int, ...]) -> str:
+    sizes = tuple(sorted(int(s) for s in sizes))
+    if not sizes:
+        return "char_?"
+    if len(sizes) > 1 and all(b - a == 1 for a, b in zip(sizes, sizes[1:])):
+        return f"char_{sizes[0]}-{sizes[-1]}"
+    return "char_" + "_".join(str(s) for s in sizes)
+
+
+def _ngram_bucket(row_bucket: str, is_positive: bool, neg_type: str) -> str:
+    if is_positive:
+        if row_bucket == "latin_latin":
+            return "pos_latin_latin"
+        if row_bucket == "deva_deva":
+            return "pos_deva_deva"
+        if row_bucket in _CROSS_SCRIPT_BUCKETS:
+            return "pos_cross"
+        return "pos_other"
+    if neg_type in _HARD_NEG_TYPES:
+        return "hard_neg"
+    return "random_neg"
+
+
+def run_char_ngram_eda(
+    pos_feat: Optional[pd.DataFrame],
+    negs_feat: Optional[pd.DataFrame],
+    cfg: AppConfig,
+) -> Dict[str, Any]:
+    """Word-token vs char-n-gram similarity across script buckets + cost.
+
+    Similarities are computed on conservative normalized names. Runtime per
+    representation is measured (summary only, never in the CSV — timings are
+    environment-dependent and must not break determinism checks).
+    """
+    columns = ["representation", "granularity", "bucket", "n",
+               "mean", "p10", "p50", "p90"]
+    pos_feat = _ensure_multilingual_pair_columns(pos_feat, cfg)
+    negs_feat = _ensure_multilingual_pair_columns(negs_feat, cfg)
+    raw_grans = _multilingual_cfg(cfg).get(
+        "char_ngram_granularities", [[2, 3, 4], [3, 4, 5], [3, 4, 5, 6]])
+    granularities: List[Tuple[int, ...]] = []
+    for g in raw_grans:
+        try:
+            granularities.append(tuple(sorted(int(x) for x in g)))
+        except (TypeError, ValueError):
+            continue
+    if not granularities:
+        granularities = [(3, 4, 5)]
+    out_csv = cfg.eda_dir / "16_char_ngram_comparison.csv"
+    pairs: List[Tuple[str, str, str, bool, str]] = []
+    if pos_feat is not None and not pos_feat.empty:
+        for row in pos_feat.itertuples(index=False):
+            d = row._asdict() if hasattr(row, "_asdict") else {}
+            def _g(key: str, default: str = "") -> str:
+                try:
+                    v = d[key] if isinstance(d, dict) else getattr(row, key)
+                except Exception:
+                    return default
+                return "" if v is None else str(v)
+            pairs.append((_g("s1_name_norm"), _g("cand_name_norm"),
+                          _g("name_script_bucket"), True, ""))
+    if negs_feat is not None and not negs_feat.empty:
+        for row in negs_feat.itertuples(index=False):
+            d = row._asdict() if hasattr(row, "_asdict") else {}
+            def _g2(key: str, default: str = "") -> str:
+                try:
+                    v = d[key] if isinstance(d, dict) else getattr(row, key)
+                except Exception:
+                    return default
+                return "" if v is None else str(v)
+            pairs.append((_g2("s1_name_norm"), _g2("cand_name_norm"),
+                          _g2("name_script_bucket"), False, _g2("neg_type")))
+    if not pairs:
+        pd.DataFrame(columns=columns).to_csv(out_csv, index=False)
+        return {"ngram_csv": str(out_csv), "artifacts": [str(out_csv)],
+                "timings_sec": {}, "granularities": [], "headline": {}}
+    rep_defs: List[Tuple[str, object]] = [("word_token", None)]
+    rep_defs += [(_granularity_label(g), g) for g in granularities]
+    sims: Dict[str, List[float]] = {name: [] for name, _ in rep_defs}
+    timings: Dict[str, float] = {}
+    for rep_name, gran in rep_defs:
+        t0 = time.perf_counter()
+        if gran is None:
+            sims[rep_name] = [word_jaccard(a, b) for a, b, _, _, _ in pairs]
+        else:
+            assert isinstance(gran, tuple)
+            sims[rep_name] = [char_ngram_jaccard(a, b, gran) for a, b, _, _, _ in pairs]
+        timings[rep_name] = round(time.perf_counter() - t0, 3)
+    bucket_of = [_ngram_bucket(b, is_pos, nt) for _, _, b, is_pos, nt in pairs]
+    bucket_order = ["pos_latin_latin", "pos_deva_deva", "pos_cross", "pos_other",
+                    "hard_neg", "random_neg"]
+    rows: List[Dict[str, object]] = []
+    for rep_name, gran in rep_defs:
+        vals = np.array(sims[rep_name], dtype=float)
+        gran_label = "1-grams(words)" if gran is None else ",".join(str(x) for x in gran)
+        for bucket in bucket_order:
+            mask = np.array([b == bucket for b in bucket_of])
+            if not mask.any():
+                continue
+            v = vals[mask]
+            rows.append({
+                "representation": rep_name,
+                "granularity": gran_label,
+                "bucket": bucket,
+                "n": int(mask.sum()),
+                "mean": round(float(v.mean()), 6),
+                "p10": round(float(np.percentile(v, 10)), 6),
+                "p50": round(float(np.percentile(v, 50)), 6),
+                "p90": round(float(np.percentile(v, 90)), 6),
+            })
+    report = pd.DataFrame(rows, columns=columns)
+    report.to_csv(out_csv, index=False)
+    artifacts = [str(out_csv)]
+
+    # figure: ECDF per representation for pos_all / pos_cross / hard / random
+    _apply_style(cfg)
+    n_panels = len(rep_defs)
+    fig, axes = plt.subplots(1, max(n_panels, 1), figsize=(4.2 * max(n_panels, 1), 4.2),
+                             sharey=True)
+    if n_panels == 1:
+        axes = [axes]
+    line_defs = [
+        ("pos_all", np.array([p[3] for p in pairs])),
+        ("pos_cross", np.array([b == "pos_cross" for b in bucket_of])),
+        ("hard_neg", np.array([b == "hard_neg" for b in bucket_of])),
+        ("random_neg", np.array([b == "random_neg" for b in bucket_of])),
+    ]
+    for ax, (rep_name, _) in zip(axes, rep_defs):
+        vals = np.array(sims[rep_name], dtype=float)
+        for line_name, mask in line_defs:
+            if mask.any():
+                x, y = _ecdf(vals[mask])
+                ax.plot(x, y, label=f"{line_name} (n={int(mask.sum())})")
+        ax.set_title(rep_name)
+        ax.set_xlabel("similarity")
+        ax.legend(fontsize=7)
+    axes[0].set_ylabel("ECDF")
+    fig.suptitle("Word-token vs char-n-gram similarity (sampled pairs)")
+    fig.tight_layout()
+    artifacts.append(_savefig(fig, cfg.figures_dir / "char_ngram_comparison.png", cfg))
+
+    headline: Dict[str, Dict[str, float]] = {}
+    for rep_name, _ in rep_defs:
+        sub = report[report.representation == rep_name]
+        entry: Dict[str, float] = {}
+        for bucket in ("pos_cross", "hard_neg", "random_neg"):
+            sel = sub[sub.bucket == bucket]
+            if not sel.empty:
+                entry[bucket] = float(sel["p50"].iloc[0])
+        headline[rep_name] = entry
+    return {
+        "ngram_csv": str(out_csv),
+        "artifacts": artifacts,
+        "timings_sec": dict(timings),
+        "granularities": [list(g) for g in granularities],
+        "headline": headline,
+    }
+
+
 CASEBOOK_DISPLAY_FEATURES = [
     "name_exact", "name_ratio", "name_token_set", "addr_exact", "addr_ratio",
     "addr_token_jaccard", "numeric_any_overlap", "numeric_conflict",
     "postcode_any_overlap", "house_number_agree", "country_equal",
+    "s1_name_script", "cand_name_script", "name_script_bucket",
+    "translit_name_agree_exact", "translit_name_ratio",
 ]
+
+
+def _suffix_overlap_mask(df: pd.DataFrame, tokens: Collection[str]) -> pd.Series:
+    """Rows whose norm-name token overlap includes any of `tokens` (measure)."""
+    want = set(tokens)
+    if df.empty or "s1_name_norm" not in df.columns or "cand_name_norm" not in df.columns:
+        return pd.Series([], dtype=bool)
+    s1_list = df["s1_name_norm"].fillna("").astype(str).tolist()
+    cand_list = df["cand_name_norm"].fillna("").astype(str).tolist()
+    flags = [bool(set(tokenize(a)) & set(tokenize(b)) & want)
+             for a, b in zip(s1_list, cand_list)]
+    return pd.Series(flags, index=df.index)
 
 
 def _case_records(df: pd.DataFrame, bucket: str, label_text: str) -> List[Dict[str, str]]:
@@ -2266,6 +3215,102 @@ def build_casebook(
         for b in ("hardneg_high_score", "neg_exact_name", "neg_exact_address", "boundary_negatives"):
             buckets[b] = []
 
+    # Multilingual buckets (§28.8) over the SAME sampled pairs (annotated once).
+    try:
+        _ensure_multilingual_pair_columns(pos_feat, cfg)
+        _ensure_multilingual_pair_columns(negs_feat, cfg)
+    except Exception as exc:
+        logger.warning("Multilingual pair annotation failed: %s", exc)
+    ml_cfg = _multilingual_cfg(cfg)
+    helpful_thr = float(ml_cfg.get("translit_helpful_threshold", 0.8))
+    danger_thr = float(ml_cfg.get("translit_dangerous_threshold", 0.9))
+
+    def _ml_bucket(name: str, df: pd.DataFrame, mask, sort_by: str,
+                   ascending: bool, label_text: str) -> None:
+        try:
+            need = {"s1_name_script", "cand_name_script", "name_script_bucket",
+                    "translit_name_agree_exact", "translit_name_ratio"}
+            if df.empty or not need.issubset(set(df.columns)):
+                buckets[name] = []
+                return
+            m = mask.reindex(df.index).fillna(False).to_numpy(dtype=bool)
+            sub = df[m].copy()
+            if sort_by in sub.columns:
+                sub = sub.sort_values(sort_by, ascending=ascending, kind="mergesort")
+            buckets[name] = _case_records(sub.head(k), name, label_text)
+        except Exception as exc:
+            logger.warning("Casebook bucket %s skipped: %s", name, exc)
+            buckets[name] = []
+
+    _all_false_pos = pd.Series(False, index=pos_feat.index) if not pos_feat.empty else pd.Series([], dtype=bool)
+    _all_false_neg = pd.Series(False, index=negs_feat.index) if not negs_feat.empty else pd.Series([], dtype=bool)
+    pos_ml_ok = (not pos_feat.empty
+                 and {"s1_name_script", "cand_name_script", "name_script_bucket",
+                      "translit_name_agree_exact", "translit_name_ratio"}.issubset(pos_feat.columns))
+    neg_ml_ok = (not negs_feat.empty
+                 and {"s1_name_script", "cand_name_script", "name_script_bucket",
+                      "translit_name_agree_exact", "translit_name_ratio"}.issubset(negs_feat.columns))
+    hard_neg = (negs_feat[negs_feat["neg_type"].isin(list(_HARD_NEG_TYPES))]
+                if neg_ml_ok and "neg_type" in negs_feat.columns else negs_feat.head(0))
+
+    # 1. Devanagari–Devanagari positives (same-script non-Latin behavior)
+    _ml_bucket("ml_deva_deva_positive", pos_feat,
+               (pos_feat["s1_name_script"] == "Devanagari")
+               & (pos_feat["cand_name_script"] == "Devanagari") if pos_ml_ok else _all_false_pos,
+               "name_ratio", True, "positive(1)")
+    # 2. Latin–Devanagari cross-script positives
+    _ml_bucket("ml_latin_deva_positive", pos_feat,
+               pos_feat["name_script_bucket"] == "cross_latin_deva" if pos_ml_ok else _all_false_pos,
+               "name_ratio", True, "positive(1)")
+    # 3. Positives that agree ONLY after transliteration
+    _ml_bucket("ml_same_after_transliteration", pos_feat,
+               (pos_feat["translit_name_agree_exact"] == 1.0)
+               & (pos_feat["name_exact"] == 0.0)
+               if pos_ml_ok and "name_exact" in pos_feat.columns else _all_false_pos,
+               "translit_name_ratio", False, "positive(1)")
+    # 4. Positives where transliteration disagrees (recall risk if trusted)
+    _ml_bucket("ml_transliteration_disagreement", pos_feat,
+               (pos_feat["translit_name_agree_exact"] == 0.0)
+               & (pos_feat["translit_name_ratio"] < helpful_thr) if pos_ml_ok else _all_false_pos,
+               "translit_name_ratio", True, "positive(1)")
+    # 5. Hard negatives with HIGH transliteration similarity (false-merge risk)
+    _ml_bucket("ml_high_translit_hard_negative", hard_neg,
+               ((hard_neg["translit_name_agree_exact"] == 1.0)
+                | (hard_neg["translit_name_ratio"] >= danger_thr))
+               if neg_ml_ok and not hard_neg.empty else _all_false_neg.reindex(
+                   hard_neg.index).fillna(False) if not hard_neg.empty else pd.Series([], dtype=bool),
+               "translit_name_ratio", False, "negative(0)")
+    # 6. Positives with low token overlap but high character similarity
+    _ml_bucket("ml_low_token_overlap_positive", pos_feat,
+               (pos_feat["name_token_set"] < 0.3)
+               if pos_ml_ok and "name_token_set" in pos_feat.columns else _all_false_pos,
+               "name_ratio", False, "positive(1)")
+    # 7. Positives sharing an English legal suffix (measure-only, never stripped)
+    _ml_bucket("ml_suffix_shared_positive", pos_feat,
+               _suffix_overlap_mask(pos_feat, LEGAL_SUFFIX_TOKENS) if pos_ml_ok else _all_false_pos,
+               "name_ratio", True, "positive(1)")
+    # 8. Positives whose overlap is stopwords only (what removal would destroy)
+    if pos_ml_ok and "s1_name_norm" in pos_feat.columns and "cand_name_norm" in pos_feat.columns:
+        _sw_flags = []
+        for a, b in zip(pos_feat["s1_name_norm"].fillna("").astype(str).tolist(),
+                        pos_feat["cand_name_norm"].fillna("").astype(str).tolist()):
+            overlap = set(tokenize(a)) & set(tokenize(b))
+            _sw_flags.append(bool(overlap) and overlap <= EN_STOPWORDS_MEASURE)
+        _sw_mask = pd.Series(_sw_flags, index=pos_feat.index)
+    else:
+        _sw_mask = _all_false_pos
+    _ml_bucket("ml_stopword_only_overlap", pos_feat, _sw_mask,
+               "name_ratio", False, "positive(1)")
+    # 9. Positives sharing an Indic suffix candidate (no equivalence assumed)
+    _ml_bucket("ml_indic_suffix_positive", pos_feat,
+               _suffix_overlap_mask(pos_feat, INDIC_SUFFIX_TOKENS) if pos_ml_ok else _all_false_pos,
+               "name_ratio", True, "positive(1)")
+    # 10. Cross-script hard negatives
+    _ml_bucket("ml_cross_script_hard_negative", hard_neg,
+               hard_neg["name_script_bucket"].isin(list(_CROSS_SCRIPT_BUCKETS))
+               if neg_ml_ok and not hard_neg.empty else _all_false_neg,
+               "translit_name_ratio", False, "negative(0)")
+
     # large candidate groups (blocking anchors only; closed-world labels apply)
     large_group_recs: List[Dict[str, str]] = []
     try:
@@ -2341,6 +3386,9 @@ def build_casebook(
 
     # -- render HTML (fully self-contained: inline CSS/JS, no network) --
     all_recs = [r for rs in buckets.values() for r in rs]
+    empty_buckets = sorted(b for b, rs in buckets.items() if not rs)
+    empty_line = ("No examples found: " + ", ".join(empty_buckets) + "."
+                  if empty_buckets else "No examples found: none — every bucket has rows.")
     options = "\n".join(
         f'<option value="{html.escape(b)}">{html.escape(b)} (n={len(rs)})</option>'
         for b, rs in buckets.items()
@@ -2369,7 +3417,9 @@ tr:nth-child(even){{background:#fafafa}}
 <h1>Casebook — difficult train pairs</h1>
 <div class="meta">Thresholds: low_name&le;{lo_name}, low_addr&le;{lo_addr}, high_neg_name&ge;{hi_name},
 high_neg_addr&ge;{hi_addr}, boundary=[{b_lo},{b_hi}], per-bucket cap={k}. Click a header to sort;
-use the search box / bucket filter to narrow rows. France bucket is unlabeled retrieval illustration.</div>
+use the search box / bucket filter to narrow rows. France bucket is unlabeled retrieval illustration.
+Multilingual buckets (ml_*): translit helpful&lt;{helpful_thr}, dangerous&ge;{danger_thr}.
+{html.escape(empty_line)}</div>
 <div class="controls">
 <label>Search <input id="q" type="text" placeholder="type to filter..." size="40"></label>
 <label>Bucket <select id="bucket"><option value="">(all)</option>
@@ -2419,6 +3469,7 @@ applyFilter();
         "artifacts": [str(out_html)],
         "bucket_counts": {b: len(rs) for b, rs in buckets.items()},
         "n_rows": len(all_recs),
+        "empty_buckets": empty_buckets,
     }
 
 
@@ -2438,15 +3489,21 @@ def _render_sampling_section(R: Dict[str, Any]) -> str:
     lines = [
         f"- Fast mode: `{fast}` (divides sampling sizes ~5x, floor 500).",
         "- FULL-data sections (no sampling): dataset audit (01), ground-truth counts (02), "
-        "raw + conservative-norm collisions (05), country counts + missing rates (08).",
+        "raw + conservative-norm collisions (05), country counts + missing rates (08), "
+        "script distribution (11), character-stat denominators (14 `n` + non-ASCII rates).",
         "- SAMPLED sections: positive features (03), hard negatives (04), aggressive-norm "
         "collisions (05 `__sample*` rows), blocking recall/burden (06/07), country string-stats "
-        "+ vocab coverage (08 `n_sampled`), candidate graph (09, on the blocking union).",
+        "+ vocab coverage (08 `n_sampled`), candidate graph (09, on the blocking union), "
+        "transliteration collisions (12), character stats (14 `n_sampled`), cross-script "
+        "positives (13), token audit (15), char-n-gram comparison (16).",
+        f"- Transliteration backend: `{samp.get('transliteration_backend', 'NA')}` "
+        "(additional feature only, never canonical).",
     ]
     if cfg_s:
         order = ["n_positive_s1", "max_positive_pairs", "n_negative_match_anchors",
                  "n_negative_singleton_anchors", "retrieval_pool_sample", "n_blocking_s1",
-                 "blocking_pool_sample", "country_shift_per_group", "collision_aggressive_sample"]
+                 "blocking_pool_sample", "country_shift_per_group", "collision_aggressive_sample",
+                 "transliteration_sample"]
         cfg_line = "; ".join(f"{k}={cfg_s.get(k, 'NA')}" for k in order if k in cfg_s)
         lines.append(f"- Config sample sizes: {cfg_line}.")
     bits: List[str] = []
@@ -2515,6 +3572,57 @@ def generate_summary_md(
 
     n_rows = audit.get("n_rows", {}) or {}
     dataset_line = "; ".join(f"{t}={n}" for t, n in sorted(n_rows.items())) or "NA"
+
+    # multilingual locals (all NA-safe; sections may be skipped)
+    script_d = R.get("script_dist", {}) or {}
+    nlr = script_d.get("non_latin_rates", {}) or {}
+    nlr_line = "; ".join(
+        f"{src}: name={_fmt_pct((rates or {}).get('business_name'))}, "
+        f"addr={_fmt_pct((rates or {}).get('business_address'))}"
+        for src, rates in sorted(nlr.items())
+    ) or "NA"
+    tr = R.get("translit", {}) or {}
+    tr_backend = tr.get("backend", "NA")
+    tr_tab = tr.get("per_table", {}) or {}
+    tr_lines = []
+    for t in ("train_source1", "train_source2", "train_source3",
+              "test_source1", "test_source2", "test_source3"):
+        reps = tr_tab.get(t, {}) or {}
+        raw_u = (reps.get("raw_name", {}) or {}).get("n_unique")
+        tr_u = (reps.get("translit_name", {}) or {}).get("n_unique")
+        cross = (reps.get("translit_name", {}) or {}).get("n_cross_script_groups")
+        delta = ("NA" if raw_u is None or tr_u is None
+                 else f"{int(raw_u - tr_u):+} merges")
+        tr_lines.append(f"{t}: raw_name_unique={raw_u if raw_u is not None else 'NA'} vs "
+                        f"translit_name_unique={tr_u if tr_u is not None else 'NA'} "
+                        f"({delta}); translit cross-script groups="
+                        f"{cross if cross is not None else 'NA'}")
+    tr_line = "; ".join(tr_lines) if tr_tab else "NA (transliteration-collision section skipped)"
+    xs = R.get("xscript", {}) or {}
+    xs_pair = "; ".join(
+        f"{sp}: n={v.get('n', 'NA')}, cross={_fmt_pct(v.get('cross_script_rate'))}, "
+        f"same-after-translit={_fmt_pct(v.get('translit_exact_rate'))}"
+        for sp, v in sorted((xs.get("by_source_pair", {}) or {}).items())
+    ) or "NA"
+    tok = R.get("token_audit", {}) or {}
+    tok_head = tok.get("headline", {}) or {}
+    tok_line = "; ".join(
+        f"{b}: n={v.get('n', 'NA')}, word-jaccard-p50={v.get('word_jaccard_p50', 'NA')}, "
+        f"token-set-p50={v.get('token_set_p50', 'NA')}, "
+        f"indic-suffix-share={_fmt_pct(v.get('indic_suffix_shared_rate'))}"
+        for b, v in sorted(tok_head.items())
+    ) or "NA"
+    ng = R.get("char_ngram", {}) or {}
+    ng_head = ng.get("headline", {}) or {}
+    ng_line = "; ".join(
+        f"{rep}: pos_cross_p50={v.get('pos_cross', 'NA')}, "
+        f"hard_neg_p50={v.get('hard_neg', 'NA')}, random_neg_p50={v.get('random_neg', 'NA')}"
+        for rep, v in sorted(ng_head.items())
+    ) or "NA"
+    ng_time = "; ".join(f"{rep}={sec}s" for rep, sec in
+                        sorted((ng.get("timings_sec", {}) or {}).items())) or "NA"
+    ml_empty = (case.get("empty_buckets", []) or [])
+    ml_empty_line = ", ".join(ml_empty) if ml_empty else "none — every bucket has rows"
 
     md = f"""# EDA Summary — Business Entity Resolution (Stage 1)
 
@@ -2623,6 +3731,39 @@ never filter or one-hot to a fixed list, and every test entity (France included)
 prediction. Country-specific parsing (e.g. PIN heuristics) stays optional; universal
 character/token features carry the unseen-country load.
 
+## Multilingual observations
+
+- Script mix (FULL data): non-Latin row shares [{nlr_line}]; detail:
+  `eda/11_script_distribution.csv`, `script_distribution.png`. A Latin-only approach
+  could not even *see* these rows — the shares above bound its maximum loss.
+- Character load per table × country (FULL `n` + non-ASCII rates, SAMPLED char/shape
+  stats, script shares, trigram vocab): `eda/14_character_statistics.csv`.
+- Transliteration backend: `{tr_backend}` (additional feature only, never canonical).
+  Same-sample raw-vs-transliterated name uniqueness [{tr_line}]; detail:
+  `eda/12_transliteration_collision_report.csv`, `transliteration_collision_sizes.png`.
+  Extra merges are recall opportunity AND false-merge risk — the cross-script-group
+  counts are the risk side of that ledger.
+- Cross-script positives (SAMPLED, n={xs.get('n_pairs', 'NA')}): overall cross-script
+  rate {_fmt_pct(xs.get('cross_script_rate'))}; non-Latin-involved rate
+  {_fmt_pct(xs.get('nonlatin_involved_rate'))}; same-after-transliteration rate
+  {_fmt_pct(xs.get('same_after_translit_rate'))} [{xs_pair}]; detail:
+  `eda/13_cross_script_positive_pairs.csv`.
+- Token-assumption audit on positives [{tok_line}]; detail:
+  `eda/15_token_assumption_audit.csv`, `token_assumption_by_script.png`. English legal
+  suffixes and Indic suffix candidates are measured, never stripped, never equated —
+  and no English stopword removal is applied (the stopword-only-overlap column shows
+  what such removal would destroy).
+- Word-token vs char-n-gram p50 [{ng_line}] with single-thread timings [{ng_time}];
+  detail: `eda/16_char_ngram_comparison.csv`, `char_ngram_comparison.png`. No
+  representation is crowned here — keep raw, normalized, char-level, token-level and
+  optional-transliteration signals side by side into Stage 2/3.
+
+**Finding → Evidence → Implication:** keep every representation (raw Unicode,
+normalized Unicode, char-level, token-level, transliteration-as-feature) because each
+fails on a different slice — Latin-only matching, ASCII folding, stopword stripping and
+suffix stripping each delete evidence this section measures. Transliteration earns its
+place only through the measured recall-vs-risk tradeoff, never by assumption.
+
 ## Blocking observations
 
 | blocker | S1–S2 recall | S1–S3 recall | overall | avg/S1 | p95/S1 | max/S1 |
@@ -2652,9 +3793,11 @@ F0.5.
 ## Important difficult cases
 
 - Casebook: `eda/10_casebook_train_pairs.html` — buckets {case.get('bucket_counts', 'NA')}.
+- Empty buckets (No examples found): {ml_empty_line}.
 - Review at least: low-name positives, low-address positives, conflicting-number
-  positives, country-mismatch positives, exact-name/exact-address negatives, and the
-  largest candidate groups before finalizing features and thresholds.
+  positives, country-mismatch positives, exact-name/exact-address negatives, the
+  largest candidate groups, and the ml_* cross-script/transliteration buckets
+  before finalizing features and thresholds.
 
 ## Modeling decisions suggested by EDA
 
@@ -2668,6 +3811,8 @@ F0.5.
 | 6 | France unseen / formatting shift | Universal char/token features; optional country-specific rules (Stage 2) |
 | 7 | Large graph hubs | Downweight common tokens; tighten broad blocks (Stage 3) |
 | 8 | Blocking recall gaps | Fix candidate generation before classifier tuning (Stage 3 first) |
+| 9 | Non-Latin/cross-script positives exist | Keep raw+normalized Unicode, char-level and token-level signals; no Latin-only/ASCII/stopword/suffix stripping defaults (Stage 2/3) |
+| 10 | Transliteration recall-vs-risk tradeoff | Use transliteration as an optional feature gated by measured agreement, never canonical (Stage 2/3) |
 
 ## Artifacts
 
@@ -2723,6 +3868,19 @@ def run_full_eda(
     logger.info("EDA 4/9: country shift (FULL counts, SAMPLED stats/vocab)")
     R["country_shift"] = run_country_shift_eda(train, test, cfg)
     artifacts += R["country_shift"].get("artifacts", [])
+
+    # 4b. multilingual table-level sections (need train+test frames alive).
+    # 11 script distribution (FULL), 14 char stats (FULL n, SAMPLED stats),
+    # 12 transliteration collisions (SAMPLED, fair raw/norm/translit).
+    logger.info("EDA 4b/9: script distribution (FULL data)")
+    R["script_dist"] = run_script_distribution_eda(source_tables, cfg)
+    artifacts += R["script_dist"].get("artifacts", [])
+    logger.info("EDA 4c/9: character statistics (FULL n, SAMPLED stats)")
+    R["char_stats"] = run_character_stats_eda(train, test, cfg)
+    artifacts += R["char_stats"].get("artifacts", [])
+    logger.info("EDA 4d/9: transliteration collisions (SAMPLED)")
+    R["translit"] = run_transliteration_collision_eda(source_tables, cfg)
+    artifacts += R["translit"].get("artifacts", [])
 
     # Free test frames (keep only a tiny France preview for the casebook).
     france_preview: Optional[pd.DataFrame] = None
@@ -2799,6 +3957,16 @@ def run_full_eda(
         artifacts += R["negatives"].get("artifacts", [])
         actual["negatives"] = neg_info
 
+        # 6b. multilingual pair-level sections on the SAME sampled pairs
+        # (annotation is shared/in-place; 03/04 were already written above).
+        logger.info("EDA 6b/9: cross-script positives + token audit + char n-grams (SAMPLED pairs)")
+        R["xscript"] = run_cross_script_positive_eda(pos_feat, cfg)
+        artifacts += R["xscript"].get("artifacts", [])
+        R["token_audit"] = run_token_assumption_audit_eda(pos_feat, negs_feat, cfg)
+        artifacts += R["token_audit"].get("artifacts", [])
+        R["char_ngram"] = run_char_ngram_eda(pos_feat, negs_feat, cfg)
+        artifacts += R["char_ngram"].get("artifacts", [])
+
         # 7. address/name deep-dives on the SAMPLED pairs
         logger.info("EDA 7/9: address + name deep-dives (SAMPLED pairs)")
         R["address"] = run_address_eda(pos_feat, negs_feat, cfg)
@@ -2854,8 +4022,30 @@ def run_full_eda(
             if not p.exists():
                 pd.DataFrame().to_csv(p, index=False)
             artifacts.append(str(p))
+        for fname, header in (
+            ("13_cross_script_positive_pairs.csv",
+             ["source_pair", "s1_country", "cand_country", "s1_script",
+              "cand_script", "n_pairs", "pct_of_source_pair",
+              "translit_exact_rate", "translit_ratio_p50",
+              "name_exact_rate", "name_ratio_p50"]),
+            ("15_token_assumption_audit.csv",
+             ["script_bucket", "class", "n", "word_jaccard_mean",
+              "word_jaccard_p50", "token_set_p50", "en_suffix_shared_rate",
+              "en_stopword_shared_rate", "indic_suffix_shared_rate",
+              "stopword_only_overlap_rate", "name_exact_rate"]),
+            ("16_char_ngram_comparison.csv",
+             ["representation", "granularity", "bucket", "n",
+              "mean", "p10", "p50", "p90"]),
+        ):
+            p = cfg.eda_dir / fname
+            if not p.exists():
+                pd.DataFrame(columns=header).to_csv(p, index=False)
+            artifacts.append(str(p))
         R["positives"] = {"skipped": True, "artifacts": []}
         R["negatives"] = {"skipped": True, "artifacts": []}
+        R["xscript"] = {"skipped": True, "artifacts": []}
+        R["token_audit"] = {"skipped": True, "artifacts": []}
+        R["char_ngram"] = {"skipped": True, "artifacts": []}
         R["address"] = {"artifacts": []}
         R["names"] = {"artifacts": []}
         R["blocking"] = {"metrics": [], "artifacts": []}
@@ -2901,12 +4091,22 @@ def run_full_eda(
         "full_data_sections": [
             "dataset audit (01)", "ground-truth counts (02)",
             "raw + conservative collisions (05)",
-            "country counts + missing rates (08)"],
+            "country counts + missing rates (08)",
+            "script distribution (11)",
+            "character-stat denominators (14 n + non-ASCII rates)"],
         "sampled_sections": [
             "positive features (03)", "hard negatives (04)",
             "aggressive collisions (05 __sample*)",
             "blocking (06/07)", "country stats/vocab (08 n_sampled)",
-            "candidate graph (09)"],
+            "candidate graph (09)",
+            "transliteration collisions (12, transliteration_sample/table)",
+            "character stats (14 n_sampled)",
+            "cross-script positives (13, sampled positives)",
+            "token audit (15, sampled pairs)",
+            "char n-gram comparison (16, sampled pairs)"],
+        "transliteration_backend": R.get("translit", {}).get("backend", "NA"),
+        "transliteration_sample_actual": dict(
+            R.get("translit", {}).get("sample_actual", {})),
     }
     meta = dict(run_meta or {})
     meta["artifacts"] = sorted(set(artifacts))
@@ -2914,4 +4114,48 @@ def run_full_eda(
     artifacts.append(summary_path)
 
     return {"results": R, "artifacts": sorted(set(artifacts))}
+    pass
+    test_small: Dict[str, Optional[pd.DataFrame]] = {"test_s1": france_preview}
+    R["casebook"] = build_casebook(
+        pos_feat, negs_feat,
+        union_pairs if union_pairs is not None else pd.DataFrame(
+            columns=["source1_entity_id", "candidate_entity_id"]),
+        known_positives,
+        s1_small_blocking if s1_small_blocking is not None else pd.DataFrame(),
+        pool_small_blocking if pool_small_blocking is not None else pd.DataFrame(),
+        test_small, cfg)
+    artifacts += R["casebook"].get("artifacts", [])
 
+    # 11. sampling disclosure + summary
+    R["sampling"] = {
+        "fast_mode": bool(cfg.eda.get("fast_mode", False)),
+        "sampling_config": dict(_sampling_cfg(cfg)),
+        "actual": dict(actual),
+        "collisions_aggressive_actual": dict(
+            R.get("collisions", {}).get("aggressive_actual", {})),
+        "full_data_sections": [
+            "dataset audit (01)", "ground-truth counts (02)",
+            "raw + conservative collisions (05)",
+            "country counts + missing rates (08)",
+            "script distribution (11)",
+            "character-stat denominators (14 n + non-ASCII rates)"],
+        "sampled_sections": [
+            "positive features (03)", "hard negatives (04)",
+            "aggressive collisions (05 __sample*)",
+            "blocking (06/07)", "country stats/vocab (08 n_sampled)",
+            "candidate graph (09)",
+            "transliteration collisions (12, transliteration_sample/table)",
+            "character stats (14 n_sampled)",
+            "cross-script positives (13, sampled positives)",
+            "token audit (15, sampled pairs)",
+            "char n-gram comparison (16, sampled pairs)"],
+        "transliteration_backend": R.get("translit", {}).get("backend", "NA"),
+        "transliteration_sample_actual": dict(
+            R.get("translit", {}).get("sample_actual", {})),
+    }
+    meta = dict(run_meta or {})
+    meta["artifacts"] = sorted(set(artifacts))
+    summary_path = generate_summary_md(R, cfg, meta)
+    artifacts.append(summary_path)
+
+    return {"results": R, "artifacts": sorted(set(artifacts))}

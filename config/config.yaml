@@ -58,6 +58,19 @@ eda:
     blocking_pool_sample: 250000    # candidate pool sample for blocking
     country_shift_per_group: 20000  # rows sampled per table x country for string stats + vocab
     collision_aggressive_sample: 1000000  # rows sampled per table for aggressive-norm collisions
+    transliteration_sample: 500000  # rows sampled per table for the transliteration collision study (12)
+
+  # ---- Multilingual / multi-script EDA (§28) ----
+  # Transliteration is an ADDITIONAL feature for comparison, never canonical.
+  # backend: auto (Unidecode when installed, else builtin) | unidecode |
+  #          builtin (deterministic, dependency-free) | none (skip transliteration)
+  multilingual:
+    transliteration_backend: "auto"
+    # Agreement thresholds used to *count* transliteration behavior on sampled
+    # pairs (casebook + audits). Not match rules.
+    translit_helpful_threshold: 0.8   # below this on positives = disagreement case
+    translit_dangerous_threshold: 0.9 # at/above this on hard negatives = false-merge risk
+    char_ngram_granularities: [[2, 3, 4], [3, 4, 5], [3, 4, 5, 6]]
 
   # ---- Negative sampling (Stage 1 diagnostics) ----
   negatives:

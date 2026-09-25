@@ -10,3 +10,8 @@ scikit-learn==1.5.1
 rapidfuzz==3.9.1
 PyYAML==6.0.1
 jupyter==1.0.0
+# Optional (NOT installed by default): Unidecode improves non-Devanagari
+# transliteration coverage in the §28 collision study. The pipeline auto-detects
+# it when present and otherwise uses the deterministic builtin backend, so
+# offline installs stay untouched. Uncomment to opt in:
+# Unidecode==1.3.8
