@@ -4,14 +4,21 @@ Every function below produces CSV artifacts under ``eda/``, figures under
 ``eda/figures/``, and returns a JSON-serializable ``results`` dict that feeds
 ``reports/eda_summary.md`` (Finding -> Evidence -> Implication).
 
+Scale rework (7.6M pairs must never materialize):
+  FULL-data: audit, ground-truth counts (vectorized), raw + conservative
+    collisions, country counts / missing rates.
+  SAMPLED: positive features, hard negatives, blocking, graph, vocab overlap,
+    aggressive-norm collisions. Every sampled artifact records its sample size;
+    ``reports/eda_summary.md`` discloses full vs sampled.
+
 Sections:
     1. run_dataset_audit                 -> 01_data_audit.csv + audit figures
     2. run_ground_truth_eda              -> 02_ground_truth_match_distribution.csv
-    3. positives / negatives             -> 03_*, 04_* + similarity figures
+    3. sampled positives / negatives     -> 03_*, 04_* + similarity figures
     4. run_normalization_collision_eda   -> 05_normalization_collision_report.csv
-    5. run_blocking_eda                  -> 06_*, 07_* + recall-vs-burden figure
-    6. run_country_shift_eda             -> 08_country_shift_report.csv
-    7. run_graph_diagnostics             -> 09_candidate_graph_diagnostics.csv
+    5. run_blocking_eda (sampled)        -> 06_*, 07_* + recall-vs-burden figure
+    6. run_country_shift_eda (sampled)   -> 08_country_shift_report.csv
+    7. run_graph_diagnostics (sampled)   -> 09_candidate_graph_diagnostics.csv
     8. build_casebook                    -> 10_casebook_train_pairs.html
     9. generate_summary_md               -> reports/eda_summary.md
 
@@ -21,12 +28,14 @@ Offline: matplotlib Agg backend (headless-safe); seaborn optional.
 
 from __future__ import annotations
 
+import gc
 import html
 import logging
 import math
+import zlib
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Collection, Dict, List, Optional, Set, Tuple
 
 import matplotlib
 
@@ -41,7 +50,7 @@ from .features import (
     add_pair_features,
     summarize_feature_frame,
 )
-from .io import expand_ground_truth
+from .io import anchor_truth_to_basic, ground_truth_stats, parse_anchor_truth
 from .normalization import (
     BUSINESS_TYPE_TOKENS,
     LEGAL_SUFFIX_TOKENS,
@@ -131,12 +140,145 @@ def ensure_normalized_columns(df: pd.DataFrame, cols: Dict[str, str]) -> pd.Data
     """Return a copy with ``name_norm/address_norm`` (+aggressive) columns added."""
     out = df.copy()
     c_name, c_addr = cols["business_name"], cols["business_address"]
-    out["name_norm"] = out[c_name].astype(str).map(normalize_basic)
-    out["address_norm"] = out[c_addr].astype(str).map(normalize_basic)
-    out["name_aggr"] = out[c_name].astype(str).map(normalize_aggressive)
-    out["address_aggr"] = out[c_addr].astype(str).map(normalize_aggressive)
+    if c_name in out.columns:
+        out["name_norm"] = out[c_name].astype(str).map(normalize_basic)
+        out["name_aggr"] = out[c_name].astype(str).map(normalize_aggressive)
+    else:
+        out["name_norm"] = ""
+        out["name_aggr"] = ""
+    if c_addr in out.columns:
+        out["address_norm"] = out[c_addr].astype(str).map(normalize_basic)
+        out["address_aggr"] = out[c_addr].astype(str).map(normalize_aggressive)
+    else:
+        out["address_norm"] = ""
+        out["address_aggr"] = ""
     out["name_address_norm"] = out["name_norm"] + " || " + out["address_norm"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# sampling helpers (scale rework: small lookups only, forced truth)
+# ---------------------------------------------------------------------------
+
+def _sampling_cfg(cfg: AppConfig) -> Dict[str, Any]:
+    return dict(cfg.eda.get("sampling", {}) or {})
+
+
+def _stable_salt(cfg: AppConfig, key: str, base: int = 0) -> int:
+    """Deterministic salt per group key (crc32, immune to hash randomization)."""
+    digest = zlib.crc32(str(key).encode("utf-8")) % 100000
+    return int(base + digest)
+
+
+def _sample_ids(ids: List[str], n: int, rng: np.random.RandomState) -> List[str]:
+    """Deterministic sample of ids (sorted output)."""
+    if len(ids) <= n:
+        return sorted(ids)
+    return sorted(rng.choice(ids, int(n), replace=False).tolist())
+
+
+def _filter_raw_to_ids(
+    df: Optional[pd.DataFrame], ids: Collection[str], id_col: str
+) -> pd.DataFrame:
+    """Filter a raw table to ``ids`` (vectorized isin, sorted by id)."""
+    if df is None or df.empty or id_col not in df.columns or not ids:
+        return pd.DataFrame(columns=list(df.columns) if df is not None else [id_col])
+    want = {str(x) for x in ids}
+    try:
+        mask = df[id_col].astype(str).isin(want)
+    except Exception:
+        return df.iloc[0:0].copy()
+    out = df.loc[mask].copy()
+    if not out.empty:
+        out = out.sort_values(id_col).reset_index(drop=True)
+    return out
+
+
+def _sample_pool_with_forced_truth(
+    s2_raw: Optional[pd.DataFrame],
+    s3_raw: Optional[pd.DataFrame],
+    forced_ids: Collection[str],
+    n_sample: int,
+    rng: np.random.RandomState,
+    id_col: str,
+) -> pd.DataFrame:
+    """Sample ``n_sample`` pool rows + FORCE every true match id.
+
+    Sampling is proportional to table sizes; forced ids are fetched via
+    vectorized ``isin`` scans (no 10M-row dict/set of the full pool). Output is
+    deduplicated and sorted by id for determinism.
+    """
+    forced_set = {str(x) for x in (forced_ids or []) if str(x)}
+    parts_raw: List[pd.DataFrame] = []
+    for df in (s2_raw, s3_raw):
+        if df is not None and not df.empty and id_col in df.columns:
+            parts_raw.append(df)
+    if not parts_raw:
+        return pd.DataFrame(columns=[id_col])
+    total = sum(len(df) for df in parts_raw)
+    if total <= int(n_sample):
+        combined = pd.concat(parts_raw, ignore_index=True)
+        if id_col in combined.columns:
+            combined = combined.drop_duplicates(subset=[id_col], keep="first")
+            combined = combined.sort_values(id_col).reset_index(drop=True)
+        return combined
+    # proportional sampling without ever concatenating the full 10M pool
+    sampled_parts: List[pd.DataFrame] = []
+    remaining = int(n_sample)
+    for i, df in enumerate(parts_raw):
+        if i == len(parts_raw) - 1:
+            n_take = remaining
+        else:
+            n_take = int(int(n_sample) * len(df) / total)
+            remaining -= n_take
+        n_take = max(0, min(n_take, len(df)))
+        if n_take <= 0:
+            continue
+        idx = rng.choice(len(df), n_take, replace=False)
+        sampled_parts.append(df.iloc[sorted(idx.tolist())].copy())
+    sampled = (
+        pd.concat(sampled_parts, ignore_index=True)
+        if sampled_parts
+        else pd.DataFrame(columns=list(parts_raw[0].columns))
+    )
+    if forced_set and not sampled.empty:
+        try:
+            have = set(sampled[id_col].astype(str).tolist())
+        except Exception:
+            have = set()
+        missing = sorted(forced_set - have)
+        if missing:
+            missing_set = set(missing)
+            extra: List[pd.DataFrame] = []
+            for df in parts_raw:
+                try:
+                    mask = df[id_col].astype(str).isin(missing_set)
+                except Exception:
+                    continue
+                hit = df.loc[mask].copy()
+                if not hit.empty:
+                    extra.append(hit)
+            if extra:
+                sampled = pd.concat([sampled] + extra, ignore_index=True)
+                sampled = sampled.drop_duplicates(subset=[id_col], keep="first")
+    elif forced_set and sampled.empty:
+        extra = []
+        missing_set = set(forced_set)
+        for df in parts_raw:
+            try:
+                mask = df[id_col].astype(str).isin(missing_set)
+            except Exception:
+                continue
+            hit = df.loc[mask].copy()
+            if not hit.empty:
+                extra.append(hit)
+        if extra:
+            sampled = pd.concat(extra, ignore_index=True).drop_duplicates(
+                subset=[id_col], keep="first"
+            )
+    if not sampled.empty and id_col in sampled.columns:
+        sampled = sampled.sort_values(id_col).reset_index(drop=True)
+    return sampled
 
 
 # ===========================================================================
@@ -290,21 +432,34 @@ def _bucket_total(n: int) -> str:
     return "4+ matches"
 
 
+def _bucket_series(n: pd.Series) -> pd.Series:
+    """Vectorized _bucket_total (C-speed select, no per-row Python)."""
+    arr = pd.to_numeric(n, errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+    out = np.select(
+        [arr == 0, arr == 1, arr == 2, arr == 3],
+        ["0 matches", "1 match", "2 matches", "3 matches"],
+        default="4+ matches",
+    )
+    return pd.Series(out, index=n.index)
+
+
 def run_ground_truth_eda(
     gt_df: Optional[pd.DataFrame],
     cfg: AppConfig,
 ) -> Dict[str, Any]:
-    """Match-count distributions per S1 (supports zero/one/many matches)."""
+    """Match-count distributions per S1 (FULL data, vectorized, no pair expansion)."""
     _apply_style(cfg)
     out_csv = cfg.eda_dir / "02_ground_truth_match_distribution.csv"
     artifacts = [str(out_csv)]
     if gt_df is None or gt_df.empty:
         pd.DataFrame(columns=["breakdown", "category", "n_s1", "pct_of_s1"]).to_csv(out_csv, index=False)
         logger.warning("Ground truth missing — wrote empty 02 CSV.")
-        return {"gt_csv": str(out_csv), "artifacts": artifacts, "skipped": True}
+        empty_stats, _ = ground_truth_stats(None, cfg.columns)
+        return {"gt_csv": str(out_csv), "artifacts": artifacts, "skipped": True,
+                "gt_stats": empty_stats, "n_s1_in_gt": 0, "n_positive_pairs": 0}
 
-    gt_stats, positives = expand_ground_truth(gt_df, cfg.columns)
-    n_s1 = len(gt_stats)
+    gt_stats, summary = ground_truth_stats(gt_df, cfg.columns)
+    n_s1 = int(summary["n_s1_in_gt"])
     rows: List[Dict[str, object]] = []
 
     def add_block(breakdown: str, series: pd.Series) -> None:
@@ -313,16 +468,17 @@ def run_ground_truth_eda(
             rows.append({"breakdown": breakdown, "category": str(cat),
                          "n_s1": int(cnt), "pct_of_s1": round(_pct(cnt, n_s1), 6)})
 
-    add_block("total_matches", gt_stats["n_matches"].map(_bucket_total))
-    add_block("s2_matches", gt_stats["n_s2_matches"].map(_bucket_total))
-    add_block("s3_matches", gt_stats["n_s3_matches"].map(_bucket_total))
+    add_block("total_matches", _bucket_series(gt_stats["n_matches"]))
+    add_block("s2_matches", _bucket_series(gt_stats["n_s2_matches"]))
+    add_block("s3_matches", _bucket_series(gt_stats["n_s3_matches"]))
     pattern = pd.Series(
         np.select(
             [gt_stats["is_singleton"] == 1, gt_stats["is_s2_only"] == 1,
              gt_stats["is_s3_only"] == 1, gt_stats["is_mixed"] == 1],
             ["singleton (no match)", "S2-only", "S3-only", "mixed S2+S3"],
             default="other",
-        )
+        ),
+        index=gt_stats.index,
     )
     add_block("match_pattern", pattern)
 
@@ -343,19 +499,19 @@ def run_ground_truth_eda(
     plt.setp(axes[1].get_xticklabels(), rotation=20, ha="right")
     artifacts.append(_savefig(fig, cfg.figures_dir / "match_count_distribution.png", cfg))
 
-    n_singleton = int(gt_stats["is_singleton"].sum())
     results = {
         "gt_csv": str(out_csv),
         "artifacts": artifacts,
         "skipped": False,
-        "n_s1_in_gt": int(n_s1),
-        "n_positive_pairs": int(len(positives)),
-        "n_s1_s2": int((positives["source_pair"] == "S1_S2").sum()),
-        "n_s1_s3": int((positives["source_pair"] == "S1_S3").sum()),
-        "singleton_rate": round(_pct(n_singleton, n_s1), 6),
-        "multi_match_rate": round(float((gt_stats["n_matches"] >= 2).mean()), 6),
-        "pattern_counts": {str(k): int(v) for k, v in pattern.value_counts().items()},
-        "total_counts": {str(k): int(v) for k, v in gt_stats["n_matches"].map(_bucket_total).value_counts().items()},
+        "n_s1_in_gt": int(summary["n_s1_in_gt"]),
+        "n_positive_pairs": int(summary["n_positive_pairs"]),
+        "n_s1_s2": int(summary["n_s1_s2"]),
+        "n_s1_s3": int(summary["n_s1_s3"]),
+        "singleton_rate": round(float(summary["singleton_rate"]), 6),
+        "multi_match_rate": round(float(summary["multi_match_rate"]), 6),
+        "pattern_counts": dict(summary["pattern_counts"]),
+        "total_counts": dict(summary["total_counts"]),
+        "gt_stats": gt_stats,  # internal reuse for sampled sections (popped before return)
     }
     return results
 
@@ -379,11 +535,25 @@ def _collision_stats(values: pd.Series) -> Dict[str, float]:
     }
 
 
+def _aggressive_sample_label(n_config: int) -> str:
+    if n_config >= 1000000 and n_config % 1000000 == 0:
+        return f"__sample{n_config // 1000000}M"
+    if n_config >= 1000 and n_config % 1000 == 0:
+        return f"__sample{n_config // 1000}k"
+    return f"__sample{n_config}"
+
+
 def run_normalization_collision_eda(
     tables: Dict[str, Optional[pd.DataFrame]],
     cfg: AppConfig,
 ) -> Dict[str, Any]:
-    """Compare uniqueness across raw / conservative / aggressive representations."""
+    """Compare uniqueness: FULL raw+conservative, SAMPLED aggressive.
+
+    Aggressive normalization is computed on ``collision_aggressive_sample``
+    rows per table only (1M default) and labeled
+    ``aggr_name__sample1M`` / ``aggr_address__sample1M`` so the CSV discloses
+    sampling via both the representation name and ``n_records``.
+    """
     cols = cfg.columns
     c_name, c_addr, c_cty = cols["business_name"], cols["business_address"], cols["country"]
     labels = {
@@ -391,41 +561,69 @@ def run_normalization_collision_eda(
         "train_s3": "train_source3", "test_s1": "test_source1",
         "test_s2": "test_source2", "test_s3": "test_source3",
     }
+    aggr_n = int(_sampling_cfg(cfg).get("collision_aggressive_sample", 1000000))
+    aggr_suffix = _aggressive_sample_label(aggr_n)
     rows: List[Dict[str, object]] = []
     largest_examples: Dict[str, Any] = {}
     cluster_sizes: Dict[str, Dict[str, np.ndarray]] = {}
-    for key, df in tables.items():
+    aggressive_actual: Dict[str, int] = {}
+    order_keys = [k for k in ("train_s1", "train_s2", "train_s3", "test_s1", "test_s2", "test_s3")
+                  if k in tables]
+    for table_idx, key in enumerate(order_keys):
+        df = tables.get(key)
         if df is None:
             continue
         if c_name not in df.columns or c_addr not in df.columns:
             logger.warning("Collision EDA skipping %s (missing name/address columns).", key)
             continue
-        normed = ensure_normalized_columns(df, cols)
-        reps = {
-            "raw_name": df[c_name].astype(str) if c_name in df.columns else pd.Series([], dtype=str),
-            "norm_name": normed["name_norm"],
-            "aggr_name": normed["name_aggr"],
-            "raw_address": df[c_addr].astype(str) if c_addr in df.columns else pd.Series([], dtype=str),
-            "norm_address": normed["address_norm"],
-            "raw_name_address": (df[c_name].astype(str) + " || " + df[c_addr].astype(str)) if (c_name in df.columns and c_addr in df.columns) else pd.Series([], dtype=str),
-            "norm_name_address": normed["name_address_norm"],
-            "norm_name_address_country": (
-                normed["name_address_norm"] + " || " + df[c_cty].astype(str).str.strip().str.lower()
-            ) if c_cty in df.columns else normed["name_address_norm"],
-        }
-        cluster_sizes[key] = {}
-        for rep_name, vals in reps.items():
+        n = len(df)
+        raw_name = df[c_name].astype(str)
+        raw_addr = df[c_addr].astype(str)
+
+        def _record(rep_name: str, vals: pd.Series) -> None:
             st = _collision_stats(vals)
             rows.append({"table": labels[key], "representation": rep_name, **st})
             vc = vals.value_counts()
             groups = vc[vc > 1]
-            cluster_sizes[key][rep_name] = groups.to_numpy(dtype=float) if len(groups) else np.array([])
+            cluster_sizes.setdefault(key, {})[rep_name] = (
+                groups.to_numpy(dtype=float) if len(groups) else np.array([])
+            )
             if len(groups):
-                top_val = str(groups.index[0])
                 largest_examples.setdefault(labels[key], {})[rep_name] = {
-                    "value_preview": top_val[:120],
+                    "value_preview": str(groups.index[0])[:120],
                     "size": int(groups.iloc[0]),
                 }
+
+        # FULL-data raw + conservative (sequential to bound memory)
+        _record("raw_name", raw_name)
+        name_norm = raw_name.map(normalize_basic)
+        _record("norm_name", name_norm)
+        _record("raw_address", raw_addr)
+        addr_norm = raw_addr.map(normalize_basic)
+        _record("norm_address", addr_norm)
+        _record("raw_name_address", raw_name + " || " + raw_addr)
+        name_addr_norm = name_norm + " || " + addr_norm
+        _record("norm_name_address", name_addr_norm)
+        if c_cty in df.columns:
+            cty_norm = df[c_cty].astype(str).str.strip().str.lower()
+            _record("norm_name_address_country", name_addr_norm + " || " + cty_norm)
+            del cty_norm
+        else:
+            _record("norm_name_address_country", name_addr_norm)
+        del name_addr_norm
+        # SAMPLED aggressive (bounded to aggr_n rows)
+        rng = _rng(cfg, salt=601 + table_idx)
+        if n > aggr_n:
+            idx = sorted(rng.choice(n, aggr_n, replace=False).tolist())
+            samp_name = raw_name.iloc[idx]
+            samp_addr = raw_addr.iloc[idx]
+        else:
+            samp_name, samp_addr = raw_name, raw_addr
+        aggressive_actual[labels[key]] = int(len(samp_name))
+        _record(f"aggr_name{aggr_suffix}", samp_name.map(normalize_aggressive))
+        _record(f"aggr_address{aggr_suffix}", samp_addr.map(normalize_aggressive))
+        del raw_name, raw_addr, name_norm, addr_norm, samp_name, samp_addr
+        gc.collect()
 
     report = pd.DataFrame(
         rows,
@@ -460,6 +658,9 @@ def run_normalization_collision_eda(
         "collision_csv": str(out_csv),
         "artifacts": artifacts,
         "largest_examples": largest_examples,
+        "aggressive_sample_config": int(aggr_n),
+        "aggressive_sample_label": aggr_suffix,
+        "aggressive_actual": dict(aggressive_actual),
         "train_norm_name_groups": {
             t: float(report[(report.table == t) & (report.representation == "norm_name")]["n_collision_groups"].sum())
             for t in ("train_source1", "train_source2", "train_source3")
@@ -468,37 +669,100 @@ def run_normalization_collision_eda(
 
 
 # ===========================================================================
-# 3. POSITIVE PAIRS + 4. HARD NEGATIVES -> 03_*, 04_* + similarity figures
+# 3. SAMPLED POSITIVE PAIRS + 4. HARD NEGATIVES -> 03_*, 04_* + figures
 # ===========================================================================
 
-def build_positive_pairs(
-    gt_df: pd.DataFrame,
-    s1_df: pd.DataFrame,
-    pool_df: pd.DataFrame,
+def build_sampled_positive_pairs(
+    s1_raw: Optional[pd.DataFrame],
+    s2_raw: Optional[pd.DataFrame],
+    s3_raw: Optional[pd.DataFrame],
+    gt_df: Optional[pd.DataFrame],
+    gt_stats: Optional[pd.DataFrame],
     cfg: AppConfig,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    """Expand ground truth into positive pairs and featurize them.
+    """Sample S1 anchors, expand ONLY their truth, and featurize (bounded).
 
-    Returns (positives_basic, positives_feat, info). Dangling references
-    (candidate id not in S2/S3) are skipped here — validation counts them.
+    Returns (positives_basic, positives_feat, info). Normalization touches
+    only the small anchor/candidate lookups; the global 7.6M pair table is
+    never built. Output is sorted by (s1, candidate) for determinism.
     """
     cols = cfg.columns
-    gt_stats, positives_basic = expand_ground_truth(gt_df, cols)
-    s1_ids = set(s1_df[cols["entity_id"]].astype(str))
-    pool_ids = set(pool_df[cols["entity_id"]].astype(str))
+    c_id = cols["entity_id"]
+    sampling = _sampling_cfg(cfg)
+    n_positive_s1 = int(sampling.get("n_positive_s1", 10000))
+    max_positive_pairs = int(sampling.get("max_positive_pairs", 30000))
+    rng = _rng(cfg, salt=301)
+    empty_basic = pd.DataFrame(
+        columns=["source1_entity_id", "candidate_entity_id", "source_pair"]
+    )
+    if gt_df is None or gt_df.empty or s1_raw is None or s1_raw.empty:
+        return empty_basic, pd.DataFrame(), {
+            "n_anchors_sampled": 0, "n_positive_rows": 0,
+            "n_dangling_skipped": 0, "n_s1_lookup": 0, "n_pool_lookup": 0,
+        }
+    if gt_stats is not None and not gt_stats.empty and cols["gt_source1"] in gt_stats.columns:
+        matched = gt_stats.loc[gt_stats["n_matches"] > 0, cols["gt_source1"]].astype(str).tolist()
+    else:
+        matched = []
+    anchor_ids = _sample_ids(sorted({str(x) for x in matched}), n_positive_s1, rng)
+    anchor_truth = parse_anchor_truth(gt_df, anchor_ids, cols)
+    positives_basic = anchor_truth_to_basic(anchor_truth)
+    n_other = 0
+    if not positives_basic.empty:
+        before = len(positives_basic)
+        positives_basic = positives_basic[
+            positives_basic["source_pair"].isin(["S1_S2", "S1_S3"])
+        ].reset_index(drop=True)
+        n_other = int(before - len(positives_basic))
+    if len(positives_basic) > max_positive_pairs:
+        idx = sorted(rng.choice(len(positives_basic), max_positive_pairs, replace=False).tolist())
+        positives_basic = positives_basic.iloc[idx].sort_values(
+            ["source1_entity_id", "candidate_entity_id"]).reset_index(drop=True)
+    elif not positives_basic.empty:
+        positives_basic = positives_basic.sort_values(
+            ["source1_entity_id", "candidate_entity_id"]).reset_index(drop=True)
+    if positives_basic.empty:
+        return positives_basic, pd.DataFrame(), {
+            "n_anchors_sampled": int(len(anchor_ids)),
+            "n_positive_rows": 0, "n_dangling_skipped": 0,
+            "n_other_dropped": int(n_other), "n_s1_lookup": 0, "n_pool_lookup": 0,
+        }
+    needed_s1 = sorted(set(positives_basic["source1_entity_id"].astype(str).tolist()))
+    needed_cand = sorted(set(positives_basic["candidate_entity_id"].astype(str).tolist()))
+    want_s1, want_cand = set(needed_s1), set(needed_cand)
+    s1_small_raw = _filter_raw_to_ids(s1_raw, want_s1, c_id)
+    pool_parts: List[pd.DataFrame] = []
+    for part in (s2_raw, s3_raw):
+        f = _filter_raw_to_ids(part, want_cand, c_id)
+        if not f.empty:
+            pool_parts.append(f)
+    pool_small_raw = (
+        pd.concat(pool_parts, ignore_index=True).drop_duplicates(subset=[c_id])
+        .sort_values(c_id).reset_index(drop=True)
+        if pool_parts else pd.DataFrame(columns=list(s1_raw.columns))
+    )
+    found_cand = set(pool_small_raw[c_id].astype(str).tolist()) if not pool_small_raw.empty else set()
+    found_s1 = set(s1_small_raw[c_id].astype(str).tolist()) if not s1_small_raw.empty else set()
     before = len(positives_basic)
     positives_basic = positives_basic[
-        positives_basic["source1_entity_id"].isin(s1_ids)
-        & positives_basic["candidate_entity_id"].isin(pool_ids)
-        & positives_basic["source_pair"].isin(["S1_S2", "S1_S3"])
+        positives_basic["source1_entity_id"].astype(str).isin(found_s1)
+        & positives_basic["candidate_entity_id"].astype(str).isin(found_cand)
     ].reset_index(drop=True)
+    n_dangling = int(before - len(positives_basic))
+    s1_small = ensure_normalized_columns(s1_small_raw, cols) if not s1_small_raw.empty else s1_small_raw
+    pool_small = ensure_normalized_columns(pool_small_raw, cols) if not pool_small_raw.empty else pool_small_raw
+    positives_feat = add_pair_features(positives_basic, s1_small, pool_small, cols, label=1, neg_type="")
     info = {
+        "n_anchors_sampled": int(len(anchor_ids)),
+        "n_anchors_with_pairs": int(len(needed_s1)),
         "n_positive_rows": int(len(positives_basic)),
-        "n_dangling_skipped": int(before - len(positives_basic)),
+        "n_dangling_skipped": int(n_dangling),
+        "n_other_dropped": int(n_other),
+        "n_s1_lookup": int(len(s1_small)),
+        "n_pool_lookup": int(len(pool_small)),
     }
-    positives_feat = add_pair_features(
-        positives_basic, s1_df, pool_df, cols, label=1, neg_type=""
-    )
+    del s1_small, pool_small, s1_small_raw, pool_small_raw
+    gc.collect()
     return positives_basic, positives_feat, info
 
 
@@ -518,7 +782,7 @@ def build_tfidf_index(
         vec = TfidfVectorizer(
             analyzer=params.get("analyzer", "char_wb"),
             ngram_range=(int(params.get("ngram_min", 3)), int(params.get("ngram_max", 5))),
-            max_features=int(params.get("max_features", 60000)),
+            max_features=int(params.get("max_features", 30000)),
             sublinear_tf=bool(params.get("sublinear_tf", True)),
             lowercase=False,  # inputs are already normalized
         )
@@ -560,7 +824,7 @@ def retrieve_topk(
     vectorizer: Optional[Any],
     pool_matrix: Optional[Any],
     k: int,
-    chunk_size: int = 2000,
+    chunk_size: int = 256,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Cosine top-k pool neighbours for each query (sparse, chunked)."""
     n = len(query_texts)
@@ -584,18 +848,29 @@ def retrieve_topk(
 # ---------------------------------------------------------------------------
 
 def build_negative_sets(
-    s1_df: pd.DataFrame,
-    pool_df: pd.DataFrame,
-    positives_set: set,
+    s1_raw: Optional[pd.DataFrame],
+    s2_raw: Optional[pd.DataFrame],
+    s3_raw: Optional[pd.DataFrame],
+    gt_df: Optional[pd.DataFrame],
+    gt_stats: Optional[pd.DataFrame],
     cfg: AppConfig,
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
-    """Sample random + name/address/hybrid hard negatives (never true matches).
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any], Dict[str, List[str]], pd.DataFrame, pd.DataFrame]:
+    """Anchor-based negatives on a SAMPLED pool with forced truth (bounded).
 
-    Returns (neg_basic_by_type, info). Each frame has
-    [source1_entity_id, candidate_entity_id, source_pair, neg_type].
+    Samples matched + singleton S1 anchors and a candidate pool that is FORCED
+    to contain every anchor's true matches, normalizes only those small
+    lookups, and mines random + TF-IDF hard negatives that exclude truth via
+    the SMALL anchor-truth dict (never a global 7.6M pair set).
+
+    Returns (neg_basic_by_type, info, anchor_truth, s1_small, pool_small).
+    Callers featurize via the returned SMALL normalized lookups.
     """
     cols = cfg.columns
     c_id = cols["entity_id"]
+    sampling = _sampling_cfg(cfg)
+    n_match_anchors = int(sampling.get("n_negative_match_anchors", 3000))
+    n_single_anchors = int(sampling.get("n_negative_singleton_anchors", 2000))
+    pool_sample_n = int(sampling.get("retrieval_pool_sample", 150000))
     neg_cfg = cfg.eda.get("negatives", {})
     n_random = int(neg_cfg.get("n_random", 3000))
     n_name = int(neg_cfg.get("n_name_hard", 3000))
@@ -603,66 +878,132 @@ def build_negative_sets(
     n_hyb = int(neg_cfg.get("n_hybrid_hard", 2000))
     topk = int(neg_cfg.get("retrieval_topk", 20))
     max_anchors = neg_cfg.get("max_s1_for_mining", 4000)
-    chunk = int(cfg.eda.get("retrieval", {}).get("query_chunk_size", 2000))
+    chunk = int(cfg.eda.get("retrieval", {}).get("query_chunk_size", 256))
 
-    s1_ids = s1_df[c_id].astype(str).tolist()
-    pool_ids = pool_df[c_id].astype(str).tolist()
-    pool_pos = {cid: i for i, cid in enumerate(pool_ids)}
-    rng = _rng(cfg, salt=101)
-    out: Dict[str, pd.DataFrame] = {}
-    info: Dict[str, Any] = {}
+    rng_anchors = _rng(cfg, salt=302)
+    rng_pool = _rng(cfg, salt=303)
+    rng_neg = _rng(cfg, salt=304)
 
     def _frame(rows: List[Tuple[str, str, str, str]]) -> pd.DataFrame:
-        return pd.DataFrame(
+        df = pd.DataFrame(
             rows, columns=["source1_entity_id", "candidate_entity_id", "source_pair", "neg_type"]
         )
+        if not df.empty:
+            df = df.sort_values(["source1_entity_id", "candidate_entity_id"]).reset_index(drop=True)
+        return df
 
     def _pair_type(cid: str) -> str:
         return "S1_S2" if cid.startswith("S2-") else ("S1_S3" if cid.startswith("S3-") else "S1_OTHER")
 
-    # -- 1. random negatives --
+    empty_out = {"random": _frame([]), "name_hard": _frame([]),
+                 "address_hard": _frame([]), "hybrid_hard": _frame([])}
+    if s1_raw is None or s1_raw.empty or gt_df is None or gt_df.empty:
+        info = {"n_random": 0, "n_name_hard": 0, "n_address_hard": 0,
+                "n_hybrid_hard": 0, "n_anchors_mined": 0,
+                "n_anchors_match": 0, "n_anchors_singleton": 0, "n_pool_sampled": 0}
+        return empty_out, info, {}, pd.DataFrame(), pd.DataFrame()
+
+    if gt_stats is not None and not gt_stats.empty and cols["gt_source1"] in gt_stats.columns:
+        matched_all = sorted({str(x) for x in
+            gt_stats.loc[gt_stats["n_matches"] > 0, cols["gt_source1"]].astype(str).tolist()})
+        single_all = sorted({str(x) for x in
+            gt_stats.loc[gt_stats["n_matches"] == 0, cols["gt_source1"]].astype(str).tolist()})
+    else:
+        matched_all, single_all = [], []
+    match_anchors = _sample_ids(matched_all, n_match_anchors, rng_anchors)
+    # reuse the same RNG stream deterministically for singletons
+    single_anchors = _sample_ids(
+        [x for x in single_all if x not in set(match_anchors)], n_single_anchors, rng_anchors)
+    anchor_ids = sorted(set(match_anchors) | set(single_anchors))
+    if not anchor_ids:
+        info = {"n_random": 0, "n_name_hard": 0, "n_address_hard": 0,
+                "n_hybrid_hard": 0, "n_anchors_mined": 0,
+                "n_anchors_match": len(match_anchors),
+                "n_anchors_singleton": len(single_anchors), "n_pool_sampled": 0}
+        return empty_out, info, {}, pd.DataFrame(), pd.DataFrame()
+
+    anchor_truth = parse_anchor_truth(gt_df, anchor_ids, cols)
+    anchor_sets: Dict[str, Set[str]] = {a: set(v) for a, v in anchor_truth.items()}
+    forced: Set[str] = set()
+    for v in anchor_truth.values():
+        forced.update(map(str, v))
+
+    pool_sample_raw = _sample_pool_with_forced_truth(
+        s2_raw, s3_raw, forced, pool_sample_n, rng_pool, c_id)
+    s1_small_raw = _filter_raw_to_ids(s1_raw, set(anchor_ids), c_id)
+    s1_small = ensure_normalized_columns(s1_small_raw, cols) if not s1_small_raw.empty else pd.DataFrame()
+    pool_small = ensure_normalized_columns(pool_sample_raw, cols) if not pool_sample_raw.empty else pd.DataFrame()
+
+    s1_ids = s1_small[c_id].astype(str).tolist() if (not s1_small.empty and c_id in s1_small.columns) else []
+    pool_ids = pool_small[c_id].astype(str).tolist() if (not pool_small.empty and c_id in pool_small.columns) else []
+
+    out: Dict[str, pd.DataFrame] = {}
+    info: Dict[str, Any] = {}
+    # -- 1. random negatives (closed-world exclusion via small anchor sets) --
     rows: List[Tuple[str, str, str, str]] = []
     seen: set = set()
     attempts = 0
     budget = max(n_random * 30, 10000)
     while len(rows) < n_random and attempts < budget and s1_ids and pool_ids:
         attempts += 1
-        a = s1_ids[rng.randint(len(s1_ids))]
-        b = pool_ids[rng.randint(len(pool_ids))]
-        if (a, b) in positives_set or (a, b) in seen:
+        a = s1_ids[rng_neg.randint(len(s1_ids))]
+        b = pool_ids[rng_neg.randint(len(pool_ids))]
+        if b in anchor_sets.get(a, set()) or (a, b) in seen:
             continue
         seen.add((a, b))
         rows.append((a, b, _pair_type(b), "random"))
     out["random"] = _frame(rows)
     info["n_random"] = len(rows)
 
-    # -- retrieval-backed hard negatives --
-    anchor_ids = sorted(set(s1_ids))
-    if max_anchors and len(anchor_ids) > int(max_anchors):
-        anchor_ids = sorted(rng.choice(anchor_ids, int(max_anchors), replace=False).tolist())
-    a_text_name = s1_df.set_index(c_id).loc[anchor_ids, "name_norm"].astype(str).tolist()
-    a_text_addr = s1_df.set_index(c_id).loc[anchor_ids, "address_norm"].astype(str).tolist()
-    p_text_name = pool_df["name_norm"].astype(str).tolist()
-    p_text_addr = pool_df["address_norm"].astype(str).tolist()
-
-    name_vec, name_mat = build_tfidf_index(p_text_name, cfg)
-    addr_vec, addr_mat = build_tfidf_index(p_text_addr, cfg)
+    # -- retrieval-backed hard negatives on the SMALL pool --
+    mining_ids = sorted(set(s1_ids))
+    if max_anchors and len(mining_ids) > int(max_anchors):
+        mining_ids = _sample_ids(mining_ids, int(max_anchors), _rng(cfg, salt=305))
+    can_retrieve = (
+        not s1_small.empty and not pool_small.empty
+        and "name_norm" in s1_small.columns and "name_norm" in pool_small.columns
+        and mining_ids and pool_ids
+    )
+    a_text_name: List[str] = []
+    a_text_addr: List[str] = []
+    name_vec = name_mat = addr_vec = addr_mat = None
+    if can_retrieve:
+        try:
+            indexed = s1_small.set_index(c_id)
+            a_text_name = indexed.loc[mining_ids, "name_norm"].astype(str).tolist()
+            a_text_addr = indexed.loc[mining_ids, "address_norm"].astype(str).tolist()
+        except KeyError:
+            keep = [a for a in mining_ids if a in set(s1_ids)]
+            mining_ids = keep
+            indexed = s1_small.set_index(c_id)
+            a_text_name = indexed.loc[mining_ids, "name_norm"].astype(str).tolist() if keep else []
+            a_text_addr = indexed.loc[mining_ids, "address_norm"].astype(str).tolist() if keep else []
+        p_text_name = pool_small["name_norm"].astype(str).tolist()
+        p_text_addr = pool_small["address_norm"].astype(str).tolist()
+        name_vec, name_mat = build_tfidf_index(p_text_name, cfg)
+        addr_vec, addr_mat = build_tfidf_index(p_text_addr, cfg)
+    else:
+        p_text_name, p_text_addr = [], []
 
     def _collect(idx: np.ndarray, n_target: int, tag: str) -> pd.DataFrame:
         """Round-robin over anchors so hard negatives cover many S1s."""
         picked: List[Tuple[str, str, str, str]] = []
         used: set = set()
         rank = 0
+        if idx.size == 0 or not mining_ids:
+            return _frame(picked)
         while len(picked) < n_target and rank < idx.shape[1]:
             progressed = False
-            for ai, a in enumerate(anchor_ids):
+            for ai, a in enumerate(mining_ids):
                 if len(picked) >= n_target:
                     break
+                if ai >= idx.shape[0]:
+                    continue
                 j = int(idx[ai, rank])
-                if j < 0:
+                if j < 0 or j >= len(pool_ids):
                     continue
                 b = pool_ids[j]
-                if (a, b) in positives_set or (a, b) in used:
+                if b in anchor_sets.get(a, set()) or (a, b) in used:
                     continue
                 used.add((a, b))
                 picked.append((a, b, _pair_type(b), tag))
@@ -670,52 +1011,65 @@ def build_negative_sets(
             if not progressed:
                 rank += 1
             else:
-                # stay on this rank until anchors are exhausted, then advance
-                # (advance when a full pass adds nothing new is handled above)
-                rank += 1 if len(picked) >= (rank + 1) * max(1, len(anchor_ids)) // 4 else 0
+                rank += 1 if len(picked) >= (rank + 1) * max(1, len(mining_ids)) // 4 else 0
                 if rank >= idx.shape[1]:
                     break
+                if rank < 0:
+                    rank = 0
         return _frame(picked)
 
-    if name_vec is not None:
+    if name_vec is not None and a_text_name:
         ni, _ = retrieve_topk(a_text_name, name_vec, name_mat, topk, chunk)
         out["name_hard"] = _collect(ni, n_name, "name_hard")
     else:
         out["name_hard"] = _frame([])
     info["n_name_hard"] = len(out["name_hard"])
 
-    if addr_vec is not None:
+    if addr_vec is not None and a_text_addr:
         ai_, _ = retrieve_topk(a_text_addr, addr_vec, addr_mat, topk, chunk)
         out["address_hard"] = _collect(ai_, n_addr, "address_hard")
     else:
         out["address_hard"] = _frame([])
     info["n_address_hard"] = len(out["address_hard"])
 
-    if name_vec is not None and addr_vec is not None:
-        # hybrid score = name cosine + address cosine (sparse add, chunked)
+    if name_vec is not None and addr_vec is not None and a_text_name and a_text_addr:
         nq = len(a_text_name)
         hyb_idx = np.full((nq, topk), -1, dtype=np.int64)
-        pool_n_t = name_mat.T.tocsr()
-        pool_a_t = addr_mat.T.tocsr()
-        for s in range(0, nq, chunk):
-            e = min(nq, s + chunk)
-            qn = name_vec.transform(a_text_name[s:e])
-            qa = addr_vec.transform(a_text_addr[s:e])
-            sims = ((qn @ pool_n_t) + (qa @ pool_a_t)).tocsr()
-            ti, _ = topk_from_sparse(sims, topk)
-            hyb_idx[s:e] = ti
-        out["hybrid_hard"] = _collect(hyb_idx, n_hyb, "hybrid_hard")
+        try:
+            pool_n_t = name_mat.T.tocsr()
+            pool_a_t = addr_mat.T.tocsr()
+            for s in range(0, nq, chunk):
+                e = min(nq, s + chunk)
+                qn = name_vec.transform(a_text_name[s:e])
+                qa = addr_vec.transform(a_text_addr[s:e])
+                sims = ((qn @ pool_n_t) + (qa @ pool_a_t)).tocsr()
+                ti, _ = topk_from_sparse(sims, topk)
+                hyb_idx[s:e] = ti
+            out["hybrid_hard"] = _collect(hyb_idx, n_hyb, "hybrid_hard")
+        except Exception as exc:
+            logger.warning("Hybrid retrieval failed (%s) — hybrid_hard empty.", exc)
+            out["hybrid_hard"] = _frame([])
     else:
         out["hybrid_hard"] = _frame([])
     info["n_hybrid_hard"] = len(out["hybrid_hard"])
-    info["n_anchors_mined"] = len(anchor_ids)
-    return out, info
+    info["n_anchors_mined"] = len(mining_ids)
+    info["n_anchors_match"] = len(match_anchors)
+    info["n_anchors_singleton"] = len(single_anchors)
+    info["n_pool_sampled"] = int(len(pool_small))
+    info["n_s1_lookup"] = int(len(s1_small))
+    return out, info, anchor_truth, s1_small, pool_small
 
 
 def _add_pair_breakdowns(
     feat: pd.DataFrame, gt_stats: Optional[pd.DataFrame], cols: Dict[str, str]
 ) -> pd.DataFrame:
+    """Add missingness/exactness/match-count buckets (small-map, no 2.2M dict)."""
     out = feat.copy()
+    if out.empty:
+        out["addr_missing_bucket"] = pd.Series(dtype=str)
+        out["name_exact_bucket"] = pd.Series(dtype=str)
+        out["s1_match_bucket"] = pd.Series(dtype=str)
+        return out
     out["addr_missing_bucket"] = np.select(
         [
             (out["s1_addr_missing"] == 1) & (out["cand_addr_missing"] == 1),
@@ -726,11 +1080,21 @@ def _add_pair_breakdowns(
         default="both_present",
     )
     out["name_exact_bucket"] = np.where(out["name_exact"] == 1.0, "exact_name", "non_exact_name")
-    if gt_stats is not None and not gt_stats.empty:
-        m = dict(zip(gt_stats[cols["gt_source1"]].astype(str), gt_stats["n_matches"].astype(int)))
-        out["s1_match_bucket"] = out["source1_entity_id"].map(m).fillna(-1).astype(int).map(
-            lambda n: "1" if n == 1 else ("2-3" if 2 <= n <= 3 else ("4+" if n >= 4 else "unknown"))
-        )
+    if gt_stats is not None and not gt_stats.empty and cols.get("gt_source1") in gt_stats.columns:
+        try:
+            needed = set(out["source1_entity_id"].astype(str).unique().tolist())
+            if len(gt_stats) > 50000 and len(needed) < len(gt_stats):
+                small = gt_stats[gt_stats[cols["gt_source1"]].astype(str).isin(needed)]
+                m = dict(zip(small[cols["gt_source1"]].astype(str),
+                             small["n_matches"].astype(int)))
+            else:
+                m = dict(zip(gt_stats[cols["gt_source1"]].astype(str),
+                             gt_stats["n_matches"].astype(int)))
+            out["s1_match_bucket"] = out["source1_entity_id"].map(m).fillna(-1).astype(int).map(
+                lambda n: "1" if n == 1 else ("2-3" if 2 <= n <= 3 else ("4+" if n >= 4 else "unknown"))
+            )
+        except Exception:
+            out["s1_match_bucket"] = "unknown"
     else:
         out["s1_match_bucket"] = "unknown"
     return out
@@ -1169,47 +1533,115 @@ def _mark_retrieved(positives: pd.DataFrame, pairs: pd.DataFrame) -> np.ndarray:
 
 
 def run_blocking_eda(
-    s1_df: pd.DataFrame,
-    pool_df: pd.DataFrame,
-    positives_basic: pd.DataFrame,
+    s1_raw: Optional[pd.DataFrame],
+    s2_raw: Optional[pd.DataFrame],
+    s3_raw: Optional[pd.DataFrame],
+    gt_df: Optional[pd.DataFrame],
+    gt_stats: Optional[pd.DataFrame],
     cfg: AppConfig,
 ) -> Dict[str, Any]:
-    """Evaluate diagnostic blockers: recall vs candidate burden + rescue map."""
+    """Anchor-based blocking diagnostics on a SAMPLED pool with forced truth.
+
+    Samples ``n_blocking_s1`` S1 anchors and a ``blocking_pool_sample`` pool
+    FORCED to contain every anchor's true matches, normalizes only those small
+    frames, and evaluates diagnostic blockers in that closed world. Returns
+    ``union_pairs`` + ``s1_small`` + ``pool_small`` + ``anchor_truth`` for the
+    graph and casebook stages (small frames only, never the full 10M pool).
+    """
     _apply_style(cfg)
     cols = cfg.columns
     c_id = cols["entity_id"]
     ret_cfg = cfg.eda.get("retrieval", {})
     blk_cfg = cfg.eda.get("blocking", {})
+    sampling = _sampling_cfg(cfg)
+    n_blocking_s1 = int(sampling.get("n_blocking_s1", 8000))
+    blocking_pool_n = int(sampling.get("blocking_pool_sample", 250000))
     enabled = blk_cfg.get("enabled", []) or []
     per_s1_cap = int(blk_cfg.get("max_candidates_per_s1_cap", 5000))
-    chunk = int(ret_cfg.get("query_chunk_size", 2000))
+    chunk = int(ret_cfg.get("query_chunk_size", 256))
+    out_metrics = cfg.eda_dir / "06_blocking_metrics.csv"
+    out_coverage = cfg.eda_dir / "07_blocking_positive_coverage.csv"
 
-    s1_ids = s1_df[c_id].astype(str).tolist()
-    pool_ids = pool_df[c_id].astype(str).tolist()
+    if s1_raw is None or s1_raw.empty or c_id not in s1_raw.columns:
+        pd.DataFrame(columns=["blocker", "n_candidate_pairs", "s1_s2_recall",
+                              "s1_s3_recall", "overall_recall", "avg_candidates_per_s1",
+                              "p50_candidates_per_s1", "p95_candidates_per_s1",
+                              "max_candidates_per_s1", "candidate_burden",
+                              "s1_with_zero_candidates", "truncated_s1"]).to_csv(out_metrics, index=False)
+        pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", "source_pair",
+                              "n_blockers_hit", "rescued_only_by"]).to_csv(out_coverage, index=False)
+        return {"metrics_csv": str(out_metrics), "coverage_csv": str(out_coverage),
+                "artifacts": [str(out_metrics), str(out_coverage)], "metrics": [],
+                "rescue_counts": {}, "union_pairs": pd.DataFrame(
+                    columns=["source1_entity_id", "candidate_entity_id"]),
+                "s1_small": pd.DataFrame(), "pool_small": pd.DataFrame(),
+                "anchor_truth": {}, "positives_small": pd.DataFrame(
+                    columns=["source1_entity_id", "candidate_entity_id", "source_pair"]),
+                "n_s1": 0, "n_pool": 0, "n_positives_sampled": 0}
+
+    rng_anchors = _rng(cfg, salt=401)
+    rng_pool = _rng(cfg, salt=402)
+    all_s1_ids = sorted({str(x) for x in s1_raw[c_id].astype(str).tolist()})
+    anchor_ids = _sample_ids(all_s1_ids, n_blocking_s1, rng_anchors)
+    anchor_truth = parse_anchor_truth(gt_df, anchor_ids, cols) if gt_df is not None else {a: [] for a in anchor_ids}
+    positives_small = anchor_truth_to_basic(anchor_truth)
+    if not positives_small.empty:
+        positives_small = positives_small[
+            positives_small["source_pair"].isin(["S1_S2", "S1_S3"])].reset_index(drop=True)
+    forced: Set[str] = set()
+    for v in anchor_truth.values():
+        forced.update(map(str, v))
+    pool_sample_raw = _sample_pool_with_forced_truth(
+        s2_raw, s3_raw, forced, blocking_pool_n, rng_pool, c_id)
+    s1_small_raw = _filter_raw_to_ids(s1_raw, set(anchor_ids), c_id)
+    s1_df = ensure_normalized_columns(s1_small_raw, cols) if not s1_small_raw.empty else pd.DataFrame()
+    pool_df = ensure_normalized_columns(pool_sample_raw, cols) if not pool_sample_raw.empty else pd.DataFrame()
+    if not positives_small.empty and not s1_df.empty and not pool_df.empty:
+        found_s1 = set(s1_df[c_id].astype(str).tolist())
+        found_pool = set(pool_df[c_id].astype(str).tolist())
+        positives_small = positives_small[
+            positives_small["source1_entity_id"].astype(str).isin(found_s1)
+            & positives_small["candidate_entity_id"].astype(str).isin(found_pool)
+        ].reset_index(drop=True)
+
+    s1_ids = s1_df[c_id].astype(str).tolist() if (not s1_df.empty and c_id in s1_df.columns) else []
+    pool_ids = pool_df[c_id].astype(str).tolist() if (not pool_df.empty and c_id in pool_df.columns) else []
     all_s1 = pd.DataFrame({"source1_entity_id": s1_ids})
 
-    # retrieval indices (fit once, reused)
-    name_vec, name_mat = build_tfidf_index(pool_df["name_norm"].astype(str).tolist(), cfg)
-    addr_vec, addr_mat = build_tfidf_index(pool_df["address_norm"].astype(str).tolist(), cfg)
+    # retrieval indices (fit once on the SMALL pool, reused)
+    if not pool_df.empty and "name_norm" in pool_df.columns:
+        name_vec, name_mat = build_tfidf_index(pool_df["name_norm"].astype(str).tolist(), cfg)
+        addr_vec, addr_mat = build_tfidf_index(pool_df["address_norm"].astype(str).tolist(), cfg)
+    else:
+        name_vec = name_mat = addr_vec = addr_mat = None
 
-    # rare-token prep
+    # rare-token prep (SMALL frames only)
     rare_df = int(ret_cfg.get("rare_token_max_df", 25))
     rare_min_len = int(ret_cfg.get("rare_token_min_len", 4))
-    pool_name_toks = [set(t for t in tokenize(t) if len(t) >= rare_min_len)
-                      for t in pool_df["name_norm"].astype(str).tolist()]
-    df_counter: Counter = Counter()
-    for toks in pool_name_toks:
-        df_counter.update(toks)
-    rare_vocab = {t for t, c in df_counter.items() if c <= rare_df}
-    s1_name_toks = [set(t for t in tokenize(t) if t in rare_vocab)
-                    for t in s1_df["name_norm"].astype(str).tolist()]
-    pool_rare_toks = [toks & rare_vocab for toks in pool_name_toks]
+    if not s1_df.empty and not pool_df.empty and "name_norm" in s1_df.columns and "name_norm" in pool_df.columns:
+        pool_name_toks = [set(t for t in tokenize(t) if len(t) >= rare_min_len)
+                          for t in pool_df["name_norm"].astype(str).tolist()]
+        df_counter: Counter = Counter()
+        for toks in pool_name_toks:
+            df_counter.update(toks)
+        rare_vocab = {t for t, c in df_counter.items() if c <= rare_df}
+        s1_name_toks = [set(t for t in tokenize(t) if t in rare_vocab)
+                        for t in s1_df["name_norm"].astype(str).tolist()]
+        pool_rare_toks = [toks & rare_vocab for toks in pool_name_toks]
+    else:
+        s1_name_toks, pool_rare_toks = [], []
 
-    # postcode prep
+    # postcode prep (SMALL frames only)
     from .normalization import extract_postcode_like_tokens as _pl
 
-    s1_post = [set(_pl(a)) for a in s1_df[cols["business_address"]].astype(str).tolist()]
-    pool_post = [set(_pl(a)) for a in pool_df[cols["business_address"]].astype(str).tolist()]
+    if not s1_df.empty and cols["business_address"] in s1_df.columns:
+        s1_post = [set(_pl(a)) for a in s1_df[cols["business_address"]].astype(str).tolist()]
+    else:
+        s1_post = [set() for _ in s1_ids]
+    if not pool_df.empty and cols["business_address"] in pool_df.columns:
+        pool_post = [set(_pl(a)) for a in pool_df[cols["business_address"]].astype(str).tolist()]
+    else:
+        pool_post = [set() for _ in pool_ids]
 
     blockers: Dict[str, pd.DataFrame] = {}
     truncations: Dict[str, int] = {}
@@ -1220,28 +1652,39 @@ def run_blocking_eda(
         truncations[name] = n_trunc
 
     if "exact_norm_name" in enabled:
-        _register("exact_norm_name", _exact_join_blocker(s1_df, pool_df, "name_norm", c_id))
+        if not s1_df.empty and not pool_df.empty and "name_norm" in s1_df.columns and "name_norm" in pool_df.columns:
+            _register("exact_norm_name", _exact_join_blocker(s1_df, pool_df, "name_norm", c_id))
+        else:
+            _register("exact_norm_name", pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id"]))
     if "exact_rare_name_token" in enabled:
         _register("exact_rare_name_token",
                   _inverted_index_blocker(s1_name_toks, pool_rare_toks, s1_ids, pool_ids))
     if "exact_postcode" in enabled:
         _register("exact_postcode",
                   _inverted_index_blocker(s1_post, pool_post, s1_ids, pool_ids))
+    s1_name_texts = s1_df["name_norm"].astype(str).tolist() if (not s1_df.empty and "name_norm" in s1_df.columns) else []
+    s1_addr_texts = s1_df["address_norm"].astype(str).tolist() if (not s1_df.empty and "address_norm" in s1_df.columns) else []
     for name in enabled:
         if name.startswith("name_tfidf_top"):
             try:
                 k = int(name.rsplit("top", 1)[1])
             except ValueError:
                 continue
-            _register(name, _topk_blocker(s1_df["name_norm"].astype(str).tolist(), s1_ids,
-                                          pool_ids, name_vec, name_mat, k, chunk))
+            if s1_name_texts and name_vec is not None:
+                _register(name, _topk_blocker(s1_name_texts, s1_ids,
+                                              pool_ids, name_vec, name_mat, k, chunk))
+            else:
+                _register(name, pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id"]))
         elif name.startswith("address_tfidf_top"):
             try:
                 k = int(name.rsplit("top", 1)[1])
             except ValueError:
                 continue
-            _register(name, _topk_blocker(s1_df["address_norm"].astype(str).tolist(), s1_ids,
-                                          pool_ids, addr_vec, addr_mat, k, chunk))
+            if s1_addr_texts and addr_vec is not None:
+                _register(name, _topk_blocker(s1_addr_texts, s1_ids,
+                                              pool_ids, addr_vec, addr_mat, k, chunk))
+            else:
+                _register(name, pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id"]))
 
     # union of all blockers
     if blockers:
@@ -1251,18 +1694,24 @@ def run_blocking_eda(
     blockers["union_all"] = union_pairs
     truncations["union_all"] = 0
 
-    # metrics
+    # metrics (sampled closed world: recall measured fairly, burden is per-sampled-S1)
     n_space = len(s1_ids) * len(pool_ids)
-    pos = positives_basic.reset_index(drop=True)
-    pos_s2 = pos[pos.source_pair == "S1_S2"]
-    pos_s3 = pos[pos.source_pair == "S1_S3"]
+    pos = positives_small.reset_index(drop=True) if positives_small is not None else pd.DataFrame(
+        columns=["source1_entity_id", "candidate_entity_id", "source_pair"])
+    if not pos.empty:
+        pos = pos.sort_values(["source1_entity_id", "candidate_entity_id"]).reset_index(drop=True)
+    pos_s2 = pos[pos.source_pair == "S1_S2"] if not pos.empty else pos
+    pos_s3 = pos[pos.source_pair == "S1_S3"] if not pos.empty else pos
     metric_rows: List[Dict[str, object]] = []
     coverage = pos.copy() if not pos.empty else pd.DataFrame(
         columns=["source1_entity_id", "candidate_entity_id", "source_pair"])
     for name, pairs in blockers.items():
-        cnt = all_s1.merge(
-            pairs.groupby("source1_entity_id").size().rename("c"), on="source1_entity_id", how="left"
-        )["c"].fillna(0).to_numpy(dtype=float)
+        if not pairs.empty and not all_s1.empty:
+            cnt = all_s1.merge(
+                pairs.groupby("source1_entity_id").size().rename("c"), on="source1_entity_id", how="left"
+            )["c"].fillna(0).to_numpy(dtype=float)
+        else:
+            cnt = np.zeros(len(s1_ids), dtype=float)
         hit = _mark_retrieved(pos, pairs)
         hit_s2 = _mark_retrieved(pos_s2, pairs)
         hit_s3 = _mark_retrieved(pos_s3, pairs)
@@ -1272,8 +1721,8 @@ def run_blocking_eda(
             "s1_s2_recall": round(float(hit_s2.mean()) if len(pos_s2) else 0.0, 6),
             "s1_s3_recall": round(float(hit_s3.mean()) if len(pos_s3) else 0.0, 6),
             "overall_recall": round(float(hit.mean()) if len(pos) else 0.0, 6),
-            "avg_candidates_per_s1": round(float(cnt.mean()), 3),
-            "p50_candidates_per_s1": round(float(np.median(cnt)), 3),
+            "avg_candidates_per_s1": round(float(cnt.mean()) if len(cnt) else 0.0, 3),
+            "p50_candidates_per_s1": round(float(np.median(cnt)) if len(cnt) else 0.0, 3),
             "p95_candidates_per_s1": round(float(np.percentile(cnt, 95)) if len(cnt) else 0.0, 3),
             "max_candidates_per_s1": int(cnt.max()) if len(cnt) else 0,
             "candidate_burden": round(_pct(len(pairs), n_space), 8),
@@ -1283,7 +1732,6 @@ def run_blocking_eda(
         if not pos.empty:
             coverage[f"hit_{name}"] = hit.astype(int)
     metrics = pd.DataFrame(metric_rows)
-    out_metrics = cfg.eda_dir / "06_blocking_metrics.csv"
     metrics.to_csv(out_metrics, index=False)
 
     # rescue map: which blocker(s) retrieved each positive
@@ -1298,7 +1746,6 @@ def run_blocking_eda(
     else:
         coverage["n_blockers_hit"] = []
         coverage["rescued_only_by"] = []
-    out_coverage = cfg.eda_dir / "07_blocking_positive_coverage.csv"
     coverage.to_csv(out_coverage, index=False)
 
     artifacts = [str(out_metrics), str(out_coverage)]
@@ -1330,8 +1777,14 @@ def run_blocking_eda(
         "metrics": metrics.to_dict(orient="records"),
         "rescue_counts": rescue_counts,
         "union_pairs": union_pairs,  # passed to graph diagnostics (not serialized here)
+        "s1_small": s1_df,  # SMALL normalized lookups for graph + casebook
+        "pool_small": pool_df,
+        "anchor_truth": anchor_truth,
+        "positives_small": pos,
         "n_s1": len(s1_ids),
         "n_pool": len(pool_ids),
+        "n_positives_sampled": int(len(pos)),
+        "n_anchors_sampled": int(len(anchor_ids)),
     }
 
 
@@ -1345,15 +1798,21 @@ def run_graph_diagnostics(
     pool_df: pd.DataFrame,
     cfg: AppConfig,
 ) -> Dict[str, Any]:
-    """Bipartite S1<->candidate diagnostics: degrees, hubs, components."""
+    """Bipartite S1<->candidate diagnostics (on SAMPLED blocking union + SMALL frames)."""
     cols = cfg.columns
     c_id, c_name, c_cty = cols["entity_id"], cols["business_name"], cols["country"]
     out_csv = cfg.eda_dir / "09_candidate_graph_diagnostics.csv"
     artifacts = [str(out_csv)]
     _apply_style(cfg)
 
-    s1_ids = s1_df[c_id].astype(str).tolist()
-    pool_ids = pool_df[c_id].astype(str).tolist()
+    if s1_df is None or s1_df.empty or c_id not in s1_df.columns:
+        s1_ids: List[str] = []
+    else:
+        s1_ids = s1_df[c_id].astype(str).tolist()
+    if pool_df is None or pool_df.empty or c_id not in pool_df.columns:
+        pool_ids: List[str] = []
+    else:
+        pool_ids = pool_df[c_id].astype(str).tolist()
     edges = candidates_df.copy() if candidates_df is not None else pd.DataFrame(
         columns=["source1_entity_id", "candidate_entity_id"])
     truncated_for_graph = 0
@@ -1370,9 +1829,15 @@ def run_graph_diagnostics(
     s1_deg_full.update(s1_deg)
     cand_deg = edges.groupby("candidate_entity_id").size()
 
-    s1_country = dict(zip(s1_df[c_id].astype(str), s1_df[c_cty].astype(str)))
-    cand_country = dict(zip(pool_df[c_id].astype(str), pool_df[c_cty].astype(str)))
-    cand_name = dict(zip(pool_df[c_id].astype(str), pool_df[c_name].astype(str)))
+    try:
+        s1_country = dict(zip(s1_df[c_id].astype(str), s1_df[c_cty].astype(str))) \
+            if (s1_df is not None and not s1_df.empty and c_id in s1_df.columns and c_cty in s1_df.columns) else {}
+        cand_country = dict(zip(pool_df[c_id].astype(str), pool_df[c_cty].astype(str))) \
+            if (pool_df is not None and not pool_df.empty and c_id in pool_df.columns and c_cty in pool_df.columns) else {}
+        cand_name = dict(zip(pool_df[c_id].astype(str), pool_df[c_name].astype(str))) \
+            if (pool_df is not None and not pool_df.empty and c_id in pool_df.columns and c_name in pool_df.columns) else {}
+    except Exception:
+        s1_country, cand_country, cand_name = {}, {}, {}
     cand_source = {cid: ("S2" if cid.startswith("S2-") else ("S3" if cid.startswith("S3-") else "OTHER"))
                    for cid in pool_ids}
 
@@ -1493,17 +1958,30 @@ def _char_ngrams(text: str, n: int) -> List[str]:
     return [t[i:i + n] for i in range(len(t) - n + 1)]
 
 
+def _sample_group_indices(n: int, per_group: int, rng: np.random.RandomState) -> np.ndarray:
+    if n <= per_group:
+        return np.arange(n, dtype=np.int64)
+    return np.array(sorted(rng.choice(n, int(per_group), replace=False).tolist()), dtype=np.int64)
+
+
 def run_country_shift_eda(
     train_tables: Dict[str, Optional[pd.DataFrame]],
     test_tables: Dict[str, Optional[pd.DataFrame]],
     cfg: AppConfig,
 ) -> Dict[str, Any]:
-    """Train vs test distribution shift per country (open-set labels)."""
+    """Train vs test shift (FULL counts/missing, SAMPLED string stats + vocab).
+
+    Full-data (vectorized): ``n``, missing rates, and country counts for the
+    figure. Sampled: all string-stat means + char/token vocab coverage on
+    ``country_shift_per_group`` rows per table x country. Adds ``n_sampled``.
+    Country stays open-set throughout.
+    """
     _apply_style(cfg)
     cols = cfg.columns
     c_name, c_addr, c_cty = cols["business_name"], cols["business_address"], cols["country"]
     ngram_n = int(cfg.eda.get("country_shift", {}).get("char_ngram_n", 3))
     char_cap = int(cfg.eda.get("country_shift", {}).get("max_vocab_chars", 4000000))
+    per_group = int(_sampling_cfg(cfg).get("country_shift_per_group", 20000))
 
     tables: Dict[str, Optional[pd.DataFrame]] = {
         "train_source1": train_tables.get("train_s1"),
@@ -1513,54 +1991,107 @@ def run_country_shift_eda(
         "test_source2": test_tables.get("test_s2"),
         "test_source3": test_tables.get("test_s3"),
     }
+    table_order = ["train_source1", "train_source2", "train_source3",
+                   "test_source1", "test_source2", "test_source3"]
 
-    # train vocabs (character n-grams + whitespace tokens over name+address)
+    # ---- FULL-data per-country n + missing rates (vectorized) ----
+    full_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    dist_rows: List[Dict[str, object]] = []
+    for table in table_order:
+        df = tables.get(table)
+        if df is None or df.empty:
+            continue
+        cty = df[c_cty].astype(str) if c_cty in df.columns else pd.Series(
+            [""] * len(df), index=df.index)
+        if c_name in df.columns:
+            name_empty = (df[c_name].astype(str).str.strip() == "")
+        else:
+            name_empty = pd.Series(np.zeros(len(df), dtype=bool), index=df.index)
+        if c_addr in df.columns:
+            addr_empty = (df[c_addr].astype(str).str.strip() == "")
+        else:
+            addr_empty = pd.Series(np.zeros(len(df), dtype=bool), index=df.index)
+        frame = pd.DataFrame({"_cty": cty, "_ne": name_empty, "_ae": addr_empty})
+        agg = frame.groupby("_cty", dropna=False).agg(
+            n=("_ne", "size"), miss_name=("_ne", "mean"), miss_addr=("_ae", "mean"))
+        per_cty: Dict[str, Dict[str, Any]] = {}
+        for cty_val, row in agg.iterrows():
+            label = str(cty_val)
+            per_cty[label] = {"n": int(row["n"]),
+                              "missing_name_rate": round(float(row["miss_name"]), 6),
+                              "missing_addr_rate": round(float(row["miss_addr"]), 6)}
+            dist_rows.append({"table": table, "country": label, "n": int(row["n"])})
+        full_stats[table] = per_cty
+
+    # ---- SAMPLED train vocabs (bounded, deterministic per-group sampling) ----
     train_char_vocab: set = set()
     train_tok_vocab: set = set()
     used_chars = 0
-    for key in ("train_source1", "train_source2", "train_source3"):
-        df = tables[key]
-        if df is None:
+    for table in ("train_source1", "train_source2", "train_source3"):
+        df = tables.get(table)
+        if df is None or df.empty or table not in full_stats:
             continue
-        for _, r in df.iterrows():
-            blob = f"{r.get(c_name, '')} {r.get(c_addr, '')}"
+        cty = df[c_cty].astype(str).to_numpy() if c_cty in df.columns else np.array([""] * len(df))
+        names = df[c_name].astype(str).to_numpy() if c_name in df.columns else np.array([""] * len(df))
+        addrs = df[c_addr].astype(str).to_numpy() if c_addr in df.columns else np.array([""] * len(df))
+        for country in sorted(full_stats[table].keys()):
             if used_chars >= char_cap:
                 break
-            used_chars += len(blob)
-            train_char_vocab.update(_char_ngrams(blob, ngram_n))
-            train_tok_vocab.update(t for t in str(blob).lower().split() if t)
+            pos = np.where(cty == country)[0]
+            if len(pos) == 0:
+                continue
+            rng = _rng(cfg, salt=_stable_salt(cfg, f"{table}::{country}::vocab", base=501))
+            take = _sample_group_indices(len(pos), per_group, rng)
+            sel = pos[take]
+            for i in sel:
+                if used_chars >= char_cap:
+                    break
+                blob = f"{names[i]} {addrs[i]}"
+                used_chars += len(blob)
+                train_char_vocab.update(_char_ngrams(blob, ngram_n))
+                train_tok_vocab.update(t for t in str(blob).lower().split() if t)
+            del pos, take, sel
+        del cty, names, addrs
         if used_chars >= char_cap:
             break
 
+    # ---- per-group rows: FULL n/missing + SAMPLED means/coverage ----
     rows: List[Dict[str, object]] = []
-    dist_rows: List[Dict[str, object]] = []
-    for table, df in tables.items():
-        if df is None:
+    for table in table_order:
+        df = tables.get(table)
+        if df is None or df.empty or table not in full_stats:
             continue
-        df = df.copy()
-        df["_cty"] = df[c_cty].astype(str) if c_cty in df.columns else ""
-        for cty, grp in df.groupby("_cty", dropna=False):
-            cty_label = str(cty)
-            name_stats = [string_stats(v) for v in grp[c_name].astype(str).tolist()] if c_name in grp.columns else []
-            addr_stats = [string_stats(v) for v in grp[c_addr].astype(str).tolist()] if c_addr in grp.columns else []
+        cty = df[c_cty].astype(str).to_numpy() if c_cty in df.columns else np.array([""] * len(df))
+        names = df[c_name].astype(str).to_numpy() if c_name in df.columns else np.array([""] * len(df))
+        addrs = df[c_addr].astype(str).to_numpy() if c_addr in df.columns else np.array([""] * len(df))
+        for country in sorted(full_stats[table].keys()):
+            pos = np.where(cty == country)[0]
+            rng = _rng(cfg, salt=_stable_salt(cfg, f"{table}::{country}::stats", base=1501))
+            take = _sample_group_indices(len(pos), per_group, rng)
+            sel = pos[take]
+            n_sampled = int(len(sel))
+            samp_names = [str(names[i]) for i in sel] if n_sampled else []
+            samp_addrs = [str(addrs[i]) for i in sel] if n_sampled else []
+            name_stats = [string_stats(v) for v in samp_names]
+            addr_stats = [string_stats(v) for v in samp_addrs]
 
             def _mean(key_: str, arr: List[Dict[str, float]]) -> float:
                 return round(float(np.mean([d[key_] for d in arr])) if arr else 0.0, 4)
 
-            # vocab coverage vs train
             c_vocab: set = set()
             t_vocab: set = set()
-            for _, r in grp.iterrows():
-                blob = f"{r.get(c_name, '')} {r.get(c_addr, '')}"
+            for a, b in zip(samp_names, samp_addrs):
+                blob = f"{a} {b}"
                 c_vocab.update(_char_ngrams(blob, ngram_n))
                 t_vocab.update(t for t in str(blob).lower().split() if t)
             char_cov = _pct(len(c_vocab & train_char_vocab), len(c_vocab)) if c_vocab else 1.0
             tok_cov = _pct(len(t_vocab & train_tok_vocab), len(t_vocab)) if t_vocab else 1.0
-
+            full = full_stats[table][country]
             rows.append({
                 "table": table,
-                "country": cty_label,
-                "n": int(len(grp)),
+                "country": country,
+                "n": int(full["n"]),
+                "n_sampled": int(n_sampled),
                 "name_len_mean": _mean("char_len", name_stats),
                 "addr_len_mean": _mean("char_len", addr_stats),
                 "name_digit_mean": _mean("digit_count", name_stats),
@@ -1572,24 +2103,32 @@ def run_country_shift_eda(
                 "name_tok_mean": _mean("token_count", name_stats),
                 "addr_tok_mean": _mean("token_count", addr_stats),
                 "addr_numtok_mean": _mean("numeric_token_count", addr_stats),
-                "missing_name_rate": round(float((grp[c_name].astype(str).str.strip() == "").mean()) if c_name in grp.columns else 0.0, 6),
-                "missing_addr_rate": round(float((grp[c_addr].astype(str).str.strip() == "").mean()) if c_addr in grp.columns else 0.0, 6),
+                "missing_name_rate": float(full["missing_name_rate"]),
+                "missing_addr_rate": float(full["missing_addr_rate"]),
                 "char_ngram_coverage_vs_train": round(char_cov, 6),
                 "char_ngram_oov_vs_train": round(1.0 - char_cov, 6),
                 "token_coverage_vs_train": round(tok_cov, 6),
             })
-            dist_rows.append({"table": table, "country": cty_label, "n": int(len(grp))})
+            del pos, take, sel
+        del cty, names, addrs
+    rows.sort(key=lambda r: (str(r["table"]), str(r["country"])))
 
-    report = pd.DataFrame(rows)
+    cols_out = ["table", "country", "n", "n_sampled", "name_len_mean", "addr_len_mean",
+                "name_digit_mean", "addr_digit_mean", "name_punct_mean", "addr_punct_mean",
+                "name_nonascii_mean", "addr_nonascii_mean", "name_tok_mean", "addr_tok_mean",
+                "addr_numtok_mean", "missing_name_rate", "missing_addr_rate",
+                "char_ngram_coverage_vs_train", "char_ngram_oov_vs_train",
+                "token_coverage_vs_train"]
+    report = pd.DataFrame(rows, columns=cols_out) if rows else pd.DataFrame(columns=cols_out)
     out_csv = cfg.eda_dir / "08_country_shift_report.csv"
     report.to_csv(out_csv, index=False)
     artifacts = [str(out_csv)]
 
-    # country distribution figure (open set: whatever labels exist)
+    # country distribution figure from FULL counts (open set: whatever labels exist)
     if dist_rows:
         dist = pd.DataFrame(dist_rows)
         pivot = dist.pivot_table(index="table", columns="country", values="n", aggfunc="sum", fill_value=0)
-        order = [t for t in tables if t in pivot.index]
+        order = [t for t in table_order if t in pivot.index]
         pivot = pivot.loc[order]
         fig, ax = plt.subplots(figsize=(10, 4.6))
         pivot.plot(kind="bar", stacked=True, ax=ax)
@@ -1599,8 +2138,8 @@ def run_country_shift_eda(
         ax.legend(title="country", fontsize=8)
         artifacts.append(_savefig(fig, cfg.figures_dir / "country_distribution.png", cfg))
 
-    train_countries = sorted({str(r["country"]) for r in rows if r["table"].startswith("train_")})
-    test_countries = sorted({str(r["country"]) for r in rows if r["table"].startswith("test_")})
+    train_countries = sorted({str(r["country"]) for r in rows if str(r["table"]).startswith("train_")})
+    test_countries = sorted({str(r["country"]) for r in rows if str(r["table"]).startswith("test_")})
     unseen = sorted(set(test_countries) - set(train_countries))
     return {
         "shift_csv": str(out_csv),
@@ -1610,6 +2149,8 @@ def run_country_shift_eda(
         "unseen_in_train": unseen,
         "n_train_char_vocab": len(train_char_vocab),
         "n_train_tok_vocab": len(train_tok_vocab),
+        "per_group_config": int(per_group),
+        "n_groups": int(len(rows)),
     }
 
 
@@ -1655,13 +2196,19 @@ def build_casebook(
     pos_feat: pd.DataFrame,
     negs_feat: pd.DataFrame,
     union_pairs: Optional[pd.DataFrame],
-    positives_set: set,
-    s1_df: pd.DataFrame,
-    pool_df: pd.DataFrame,
+    known_positives: set,
+    s1_small: Optional[pd.DataFrame],
+    pool_small: Optional[pd.DataFrame],
     test_tables: Dict[str, Optional[pd.DataFrame]],
     cfg: AppConfig,
 ) -> Dict[str, Any]:
-    """Collect difficult buckets into a sortable/filterable HTML casebook."""
+    """Collect difficult buckets (SMALL lookups + SMALL known-positive set).
+
+    ``known_positives`` holds only sampled + blocking-anchor pairs (small, never
+    the global 7.6M set). ``s1_small``/``pool_small`` are the blocking SMALL
+    normalized lookups; the large-group bucket stays within blocking anchors
+    and the France-nearest bucket searches the blocking pool sample only.
+    """
     cols = cfg.columns
     cb_cfg = cfg.eda.get("casebook", {})
     k = int(cb_cfg.get("per_bucket", 25))
@@ -1719,51 +2266,74 @@ def build_casebook(
         for b in ("hardneg_high_score", "neg_exact_name", "neg_exact_address", "boundary_negatives"):
             buckets[b] = []
 
-    # large candidate groups (train union blockers; closed-world labels apply)
+    # large candidate groups (blocking anchors only; closed-world labels apply)
     large_group_recs: List[Dict[str, str]] = []
-    if union_pairs is not None and not union_pairs.empty and s1_df is not None and pool_df is not None:
-        deg = union_pairs.groupby("source1_entity_id").size().sort_values(ascending=False).head(3)
-        for sid, _ in deg.items():
-            cands = union_pairs[union_pairs.source1_entity_id == sid]["candidate_entity_id"].astype(str).tolist()
-            sample = sorted(cands)[:15]
-            basic = pd.DataFrame({
-                "source1_entity_id": [sid] * len(sample),
-                "candidate_entity_id": sample,
-                "source_pair": ["S1_S2" if c.startswith("S2-") else "S1_S3" for c in sample],
-            })
-            feat = add_pair_features(basic, s1_df, pool_df, cols, label=0, neg_type="blocking_candidate")
-            for rec in _case_records(feat, "large_candidate_group", "negative(0)"):
-                if (rec["s1"], rec["cand"]) in positives_set:
-                    rec["label"] = "positive(1)"
-                    rec["neg_type"] = ""
-                large_group_recs.append(rec)
+    try:
+        can_large = (
+            union_pairs is not None and not union_pairs.empty
+            and s1_small is not None and not s1_small.empty
+            and pool_small is not None and not pool_small.empty
+            and "name_norm" in s1_small.columns and "name_norm" in pool_small.columns
+        )
+        if can_large:
+            assert s1_small is not None and pool_small is not None
+            deg = union_pairs.groupby("source1_entity_id").size().sort_values(ascending=False).head(3)
+            for sid, _ in deg.items():
+                cands = union_pairs[union_pairs.source1_entity_id == sid]["candidate_entity_id"].astype(str).tolist()
+                sample = sorted(cands)[:15]
+                basic = pd.DataFrame({
+                    "source1_entity_id": [sid] * len(sample),
+                    "candidate_entity_id": sample,
+                    "source_pair": ["S1_S2" if c.startswith("S2-") else "S1_S3" for c in sample],
+                })
+                feat = add_pair_features(basic, s1_small, pool_small, cols, label=0, neg_type="blocking_candidate")
+                for rec in _case_records(feat, "large_candidate_group", "negative(0)"):
+                    if (rec["s1"], rec["cand"]) in (known_positives or set()):
+                        rec["label"] = "positive(1)"
+                        rec["neg_type"] = ""
+                    large_group_recs.append(rec)
+    except Exception as exc:
+        logger.warning("Large-group bucket skipped: %s", exc)
     buckets["large_candidate_group"] = large_group_recs
 
-    # France test records nearest to train (unlabeled; retrieval illustration only)
+    # France test records nearest to the BLOCKING pool sample (unlabeled illustration)
     fr_recs: List[Dict[str, str]] = []
     try:
-        test_s1 = test_tables.get("test_s1")
-        if test_s1 is not None and pool_df is not None and not pool_df.empty:
+        test_s1 = (test_tables or {}).get("test_s1")
+        can_fr = (
+            test_s1 is not None and not test_s1.empty
+            and pool_small is not None and not pool_small.empty
+            and "name_norm" in pool_small.columns
+        )
+        if can_fr:
+            assert test_s1 is not None and pool_small is not None
             c_cty = cols["country"]
-            fr = test_s1[test_s1[c_cty].astype(str).str.strip().str.lower() == "france"].copy()
+            c_id = cols["entity_id"]
+            if c_cty in test_s1.columns:
+                fr = test_s1[test_s1[c_cty].astype(str).str.strip().str.lower() == "france"].copy()
+            else:
+                fr = test_s1.head(0).copy()
+            # test_small may already be a France-only preview; fall back to head rows
+            if fr.empty and not test_s1.empty and len(test_s1) <= 50:
+                fr = test_s1.copy()
             if not fr.empty:
                 fr = ensure_normalized_columns(fr, cols)
-                pend = min(10, len(fr))
-                fr_sample = fr.head(pend)
-                vec, mat = build_tfidf_index(pool_df["name_norm"].astype(str).tolist(), cfg)
-                if vec is not None:
-                    idx, _ = retrieve_topk(fr_sample["name_norm"].astype(str).tolist(), vec, mat, 3, 2000)
-                    pool_ids = pool_df[cols["entity_id"]].astype(str).tolist()
+                fr_sample = fr.head(min(10, len(fr)))
+                chunk = int(cfg.eda.get("retrieval", {}).get("query_chunk_size", 256))
+                vec, mat = build_tfidf_index(pool_small["name_norm"].astype(str).tolist(), cfg)
+                if vec is not None and c_id in pool_small.columns and c_id in fr_sample.columns:
+                    idx, _ = retrieve_topk(fr_sample["name_norm"].astype(str).tolist(), vec, mat, 3, chunk)
+                    pool_ids = pool_small[c_id].astype(str).tolist()
                     rows = []
-                    for ai, sid in enumerate(fr_sample[cols["entity_id"]].astype(str).tolist()):
+                    for ai, sid in enumerate(fr_sample[c_id].astype(str).tolist()):
                         for j in idx[ai]:
-                            if int(j) >= 0:
+                            if 0 <= int(j) < len(pool_ids):
                                 rows.append((sid, pool_ids[int(j)]))
                     if rows:
                         basic = pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id"])
                         basic["source_pair"] = basic["candidate_entity_id"].map(
                             lambda c: "S1_S2" if str(c).startswith("S2-") else "S1_S3")
-                        ffeat = add_pair_features(basic, fr_sample, pool_df, cols, label=-1, neg_type="unlabeled")
+                        ffeat = add_pair_features(basic, fr_sample, pool_small, cols, label=-1, neg_type="unlabeled")
                         fr_recs = _case_records(ffeat, "france_test_nearest_train", "unknown")
     except Exception as exc:  # pragma: no cover — illustrative bucket must not break EDA
         logger.warning("France-nearest bucket skipped: %s", exc)
@@ -1860,6 +2430,52 @@ def _fmt_pct(x: Optional[float]) -> str:
     return "NA" if x is None else f"{100 * float(x):.1f}%"
 
 
+def _render_sampling_section(R: Dict[str, Any]) -> str:
+    samp = R.get("sampling", {}) or {}
+    fast = samp.get("fast_mode", False)
+    cfg_s = samp.get("sampling_config", {}) or {}
+    actual = samp.get("actual", {}) or {}
+    lines = [
+        f"- Fast mode: `{fast}` (divides sampling sizes ~5x, floor 500).",
+        "- FULL-data sections (no sampling): dataset audit (01), ground-truth counts (02), "
+        "raw + conservative-norm collisions (05), country counts + missing rates (08).",
+        "- SAMPLED sections: positive features (03), hard negatives (04), aggressive-norm "
+        "collisions (05 `__sample*` rows), blocking recall/burden (06/07), country string-stats "
+        "+ vocab coverage (08 `n_sampled`), candidate graph (09, on the blocking union).",
+    ]
+    if cfg_s:
+        order = ["n_positive_s1", "max_positive_pairs", "n_negative_match_anchors",
+                 "n_negative_singleton_anchors", "retrieval_pool_sample", "n_blocking_s1",
+                 "blocking_pool_sample", "country_shift_per_group", "collision_aggressive_sample"]
+        cfg_line = "; ".join(f"{k}={cfg_s.get(k, 'NA')}" for k in order if k in cfg_s)
+        lines.append(f"- Config sample sizes: {cfg_line}.")
+    bits: List[str] = []
+    pos_a = actual.get("positives", {}) or {}
+    if pos_a:
+        bits.append(f"positives anchors={pos_a.get('n_anchors_sampled', 'NA')} "
+                    f"pairs={pos_a.get('n_positive_rows', 'NA')}")
+    neg_a = actual.get("negatives", {}) or {}
+    if neg_a:
+        bits.append(f"negatives match_anchors={neg_a.get('n_anchors_match', 'NA')} "
+                    f"singleton_anchors={neg_a.get('n_anchors_singleton', 'NA')} "
+                    f"pool={neg_a.get('n_pool_sampled', 'NA')}")
+    blk_a = actual.get("blocking", {}) or {}
+    if blk_a:
+        bits.append(f"blocking s1={blk_a.get('n_s1', blk_a.get('n_anchors_sampled', 'NA'))} "
+                    f"pool={blk_a.get('n_pool', 'NA')} "
+                    f"positives={blk_a.get('n_positives_sampled', 'NA')}")
+    coll_a = samp.get("collisions_aggressive_actual", {}) or samp.get("collisions", {}) or {}
+    if isinstance(coll_a, dict) and coll_a:
+        preview = "; ".join(f"{t}={n}" for t, n in sorted(coll_a.items())[:6])
+        bits.append(f"aggressive collisions per-table n: {preview}")
+    if bits:
+        lines.append("- Actual sampled sizes: " + "; ".join(bits) + ".")
+    lines.append("- Closed world: every sampled pool is FORCED to contain all true matches "
+                 "of its anchors, so recall/exclusion is measured fairly; labels apply only "
+                 "within each sample.")
+    return "\n".join(lines)
+
+
 def generate_summary_md(
     R: Dict[str, Any],
     cfg: AppConfig,
@@ -1876,6 +2492,7 @@ def generate_summary_md(
     graph = R.get("graph", {})
     case = R.get("casebook", {})
     audit = R.get("audit", {})
+    sampling_section = _render_sampling_section(R)
 
     by_pair = (pos.get("by_source_pair", {}) or {})
     s2 = by_pair.get("S1_S2", {}) or {}
@@ -1909,6 +2526,10 @@ def generate_summary_md(
 - Config: `{meta.get('config_path', 'NA')}` (hash `{meta.get('config_hash', 'NA')}`)
 - Git commit: `{meta.get('git_commit', 'NA')}`
 - Tables present: {', '.join(audit.get('tables_present', []) or ['NA'])}
+
+## Sampling & scale
+
+{sampling_section}
 
 ## Dataset
 
@@ -2058,7 +2679,7 @@ F0.5.
 
 
 # ===========================================================================
-# ORCHESTRATOR
+# ORCHESTRATOR (scale-safe order: full-data first, then sampled, test freed)
 # ===========================================================================
 
 def run_full_eda(
@@ -2067,7 +2688,14 @@ def run_full_eda(
     test: Dict[str, Optional[pd.DataFrame]],
     run_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run every Stage-1 section in order; return results + artifact paths."""
+    """Run every Stage-1 section in scale-safe order; return results + artifacts.
+
+    Order: (1) audit FULL, (2) ground-truth stats FULL, (3) collisions
+    FULL raw+conservative / SAMPLED aggressive, (4) country shift FULL counts /
+    SAMPLED stats, then free test frames, (5) sampled positives, (6) sampled
+    negatives, (7) address/name deep-dives, (8) sampled blocking, (9) graph on
+    the blocking union, (10) casebook with small frames, (11) summary.
+    """
     cols = cfg.columns
     artifacts: List[str] = []
     R: Dict[str, Any] = {}
@@ -2075,91 +2703,153 @@ def run_full_eda(
     # source tables only — ground truth has different columns and is handled separately
     source_tables = {k: v for k, v in {**train, **test}.items() if k != "train_gt"}
 
-    # 1. audit
-    logger.info("EDA 1/9: dataset audit")
+    # 1. audit (FULL data)
+    logger.info("EDA 1/9: dataset audit (FULL data)")
     R["audit"] = run_dataset_audit(source_tables, cfg)
     artifacts += R["audit"].get("artifacts", [])
 
-    # 2. ground truth
-    logger.info("EDA 2/9: ground-truth EDA")
+    # 2. ground truth (FULL counts, vectorized — no pair expansion)
+    logger.info("EDA 2/9: ground-truth EDA (FULL counts)")
     R["ground_truth"] = run_ground_truth_eda(train.get("train_gt"), cfg)
     artifacts += R["ground_truth"].get("artifacts", [])
+    gt_stats = R["ground_truth"].get("gt_stats")
 
-    # normalized train tables + candidate pool (S2+S3)
-    s1 = ensure_normalized_columns(train["train_s1"], cols) if train.get("train_s1") is not None else None
-    s2 = ensure_normalized_columns(train["train_s2"], cols) if train.get("train_s2") is not None else None
-    s3 = ensure_normalized_columns(train["train_s3"], cols) if train.get("train_s3") is not None else None
-    pool_parts = [p for p in (s2, s3) if p is not None]
-    pool = pd.concat(pool_parts, ignore_index=True) if pool_parts else None
-
-    # 3. normalization collisions (train + test)
-    logger.info("EDA 3/9: normalization collisions")
+    # 3. normalization collisions (FULL raw+conservative, SAMPLED aggressive)
+    logger.info("EDA 3/9: normalization collisions (FULL raw+conservative, SAMPLED aggressive)")
     R["collisions"] = run_normalization_collision_eda(source_tables, cfg)
     artifacts += R["collisions"].get("artifacts", [])
 
+    # 4. country shift (FULL counts/missing, SAMPLED stats/vocab)
+    logger.info("EDA 4/9: country shift (FULL counts, SAMPLED stats/vocab)")
+    R["country_shift"] = run_country_shift_eda(train, test, cfg)
+    artifacts += R["country_shift"].get("artifacts", [])
+
+    # Free test frames (keep only a tiny France preview for the casebook).
+    france_preview: Optional[pd.DataFrame] = None
+    try:
+        test_s1_full = test.get("test_s1") if test is not None else None
+        if test_s1_full is not None and not test_s1_full.empty and cols["country"] in test_s1_full.columns:
+            mask = test_s1_full[cols["country"]].astype(str).str.strip().str.lower() == "france"
+            france_preview = test_s1_full.loc[mask].head(10).copy()
+    except Exception:
+        france_preview = None
+    try:
+        del source_tables
+    except Exception:
+        pass
+    if test is not None:
+        for k in list(test.keys()):
+            test[k] = None
+    gc.collect()
+
+    s1_raw = train.get("train_s1")
+    s2_raw = train.get("train_s2")
+    s3_raw = train.get("train_s3")
+    gt_df = train.get("train_gt")
+    has_pool = not (
+        (s2_raw is None or s2_raw.empty) and (s3_raw is None or s3_raw.empty)
+    )
     supervised = (
-        train.get("train_gt") is not None and s1 is not None and pool is not None
-        and not train["train_gt"].empty and not s1.empty and not pool.empty
+        gt_df is not None and s1_raw is not None and has_pool
+        and not gt_df.empty and not s1_raw.empty
     )
     pos_feat = pd.DataFrame()
     negs_feat = pd.DataFrame()
     positives_basic = pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", "source_pair"])
-    positives_set: set = set()
-    gt_stats = None
     union_pairs: Optional[pd.DataFrame] = None
+    s1_small_blocking: pd.DataFrame = pd.DataFrame()
+    pool_small_blocking: pd.DataFrame = pd.DataFrame()
+    blocking_positives_small: pd.DataFrame = pd.DataFrame(
+        columns=["source1_entity_id", "candidate_entity_id", "source_pair"])
+    actual: Dict[str, Any] = {}
 
     if supervised:
-        # 4. positives
-        logger.info("EDA 4/9: positive pairs")
-        assert train["train_gt"] is not None and s1 is not None and pool is not None
-        gt_stats, _ = expand_ground_truth(train["train_gt"], cols)
-        positives_basic, pos_feat, pos_info = build_positive_pairs(train["train_gt"], s1, pool, cfg)
-        positives_set = set(zip(positives_basic["source1_entity_id"].astype(str),
-                                positives_basic["candidate_entity_id"].astype(str)))
-        logger.info("positives: %s (dangling skipped: %s)", pos_info["n_positive_rows"],
-                    pos_info["n_dangling_skipped"])
+        assert gt_df is not None and s1_raw is not None
+        # 5. sampled positives
+        logger.info("EDA 5/9: positive pairs (SAMPLED anchors)")
+        positives_basic, pos_feat, pos_info = build_sampled_positive_pairs(
+            s1_raw, s2_raw, s3_raw, gt_df, gt_stats, cfg)
+        logger.info("positives sampled: %s", pos_info)
         R["positives"] = run_positive_pair_eda(pos_feat, gt_stats, cfg)
         artifacts += R["positives"].get("artifacts", [])
+        actual["positives"] = pos_info
 
-        # 5. negatives + comparisons
-        logger.info("EDA 5/9: hard negatives")
-        neg_sets, neg_info = build_negative_sets(s1, pool, positives_set, cfg)
+        # 6. sampled negatives + featurize via returned SMALL lookups
+        logger.info("EDA 6/9: hard negatives (SAMPLED anchors + pool, forced truth)")
+        neg_sets, neg_info, _neg_truth, neg_s1_small, neg_pool_small = build_negative_sets(
+            s1_raw, s2_raw, s3_raw, gt_df, gt_stats, cfg)
         logger.info("negatives mined: %s", neg_info)
         neg_frames = []
         for tag, basic in neg_sets.items():
             if basic is None or basic.empty:
                 continue
-            f = add_pair_features(basic, s1, pool, cols, label=0, neg_type=tag)
-            neg_frames.append(f)
+            if neg_s1_small.empty or neg_pool_small.empty:
+                continue
+            try:
+                f = add_pair_features(basic, neg_s1_small, neg_pool_small, cols, label=0, neg_type=tag)
+            except Exception as exc:
+                logger.warning("Featurizing negatives '%s' failed: %s", tag, exc)
+                continue
+            if not f.empty:
+                neg_frames.append(f)
         negs_feat = pd.concat(neg_frames, ignore_index=True) if neg_frames else pd.DataFrame()
+        del neg_sets, neg_s1_small, neg_pool_small
+        gc.collect()
         R["negatives"] = run_hard_negative_eda(pos_feat, negs_feat, cfg)
         artifacts += R["negatives"].get("artifacts", [])
+        actual["negatives"] = neg_info
 
-        logger.info("EDA 6/9: address + name deep-dives")
+        # 7. address/name deep-dives on the SAMPLED pairs
+        logger.info("EDA 7/9: address + name deep-dives (SAMPLED pairs)")
         R["address"] = run_address_eda(pos_feat, negs_feat, cfg)
         artifacts += R["address"].get("artifacts", [])
         R["names"] = run_name_eda(pos_feat, negs_feat, cfg)
         artifacts += R["names"].get("artifacts", [])
 
-        # 6. blocking
-        logger.info("EDA 7/9: blocking diagnostics")
-        R["blocking"] = run_blocking_eda(s1, pool, positives_basic, cfg)
+        # 8. sampled blocking (pool forced to contain anchor truth)
+        logger.info("EDA 8/9: blocking diagnostics (SAMPLED anchors + pool)")
+        R["blocking"] = run_blocking_eda(s1_raw, s2_raw, s3_raw, gt_df, gt_stats, cfg)
         union_pairs = R["blocking"].pop("union_pairs", None)
+        s1_small_blocking = R["blocking"].pop("s1_small", pd.DataFrame())
+        pool_small_blocking = R["blocking"].pop("pool_small", pd.DataFrame())
+        R["blocking"].pop("anchor_truth", {})
+        blocking_positives_small = R["blocking"].pop("positives_small", blocking_positives_small)
         artifacts += R["blocking"].get("artifacts", [])
+        actual["blocking"] = {
+            k: R["blocking"].get(k) for k in
+            ("n_s1", "n_pool", "n_positives_sampled", "n_anchors_sampled")
+            if k in R["blocking"]
+        }
 
-        # 7. graph
-        logger.info("EDA 8/9: candidate graph diagnostics")
+        # free heavy train frames + gt_stats before graph/casebook (small only now)
+        try:
+            for k in list(train.keys()):
+                train[k] = None
+        except Exception:
+            pass
+        try:
+            R["ground_truth"].pop("gt_stats", None)
+        except Exception:
+            pass
+        gt_stats = None
+        gc.collect()
+
+        # 9. graph diagnostics on the SAMPLED union with SMALL frames
+        logger.info("EDA 9/9: candidate graph diagnostics (SAMPLED union)")
         R["graph"] = run_graph_diagnostics(
             union_pairs if union_pairs is not None else pd.DataFrame(
-                columns=["source1_entity_id", "candidate_entity_id"]), s1, pool, cfg)
+                columns=["source1_entity_id", "candidate_entity_id"]),
+            s1_small_blocking if s1_small_blocking is not None else pd.DataFrame(),
+            pool_small_blocking if pool_small_blocking is not None else pd.DataFrame(),
+            cfg)
         artifacts += R["graph"].get("artifacts", [])
     else:
         logger.warning("Supervised EDA sections skipped (need train S1 + S2/S3 + ground truth).")
-        for key, fname in (("positives", "03_positive_pair_feature_summary.csv"),
-                           ("negatives", "04_hard_negative_feature_summary.csv"),
-                           ("blocking_m", "06_blocking_metrics.csv"),
-                           ("blocking_c", "07_blocking_positive_coverage.csv"),
-                           ("graph", "09_candidate_graph_diagnostics.csv")):
+        for _key, fname in (("positives", "03_positive_pair_feature_summary.csv"),
+                            ("negatives", "04_hard_negative_feature_summary.csv"),
+                            ("blocking_m", "06_blocking_metrics.csv"),
+                            ("blocking_c", "07_blocking_positive_coverage.csv"),
+                            ("graph", "09_candidate_graph_diagnostics.csv")):
             p = cfg.eda_dir / fname
             if not p.exists():
                 pd.DataFrame().to_csv(p, index=False)
@@ -2170,20 +2860,54 @@ def run_full_eda(
         R["names"] = {"artifacts": []}
         R["blocking"] = {"metrics": [], "artifacts": []}
         R["graph"] = {"artifacts": []}
+        try:
+            R["ground_truth"].pop("gt_stats", None)
+        except Exception:
+            pass
+        gt_stats = None
 
-    # 8. country shift (works with train-only too)
-    logger.info("EDA 9/9: country shift")
-    R["country_shift"] = run_country_shift_eda(train, test, cfg)
-    artifacts += R["country_shift"].get("artifacts", [])
-
-    # 9. casebook
+    # 10. casebook with SMALL frames + SMALL known positives
     logger.info("Casebook + summary")
+    known_positives: set = set()
+    try:
+        if positives_basic is not None and not positives_basic.empty:
+            known_positives.update(zip(
+                positives_basic["source1_entity_id"].astype(str).tolist(),
+                positives_basic["candidate_entity_id"].astype(str).tolist()))
+        if blocking_positives_small is not None and not blocking_positives_small.empty:
+            known_positives.update(zip(
+                blocking_positives_small["source1_entity_id"].astype(str).tolist(),
+                blocking_positives_small["candidate_entity_id"].astype(str).tolist()))
+    except Exception:
+        pass
+    test_small: Dict[str, Optional[pd.DataFrame]] = {"test_s1": france_preview}
     R["casebook"] = build_casebook(
-        pos_feat, negs_feat, union_pairs, positives_set,
-        s1 if s1 is not None else pd.DataFrame(),
-        pool if pool is not None else pd.DataFrame(), test, cfg)
+        pos_feat, negs_feat,
+        union_pairs if union_pairs is not None else pd.DataFrame(
+            columns=["source1_entity_id", "candidate_entity_id"]),
+        known_positives,
+        s1_small_blocking if s1_small_blocking is not None else pd.DataFrame(),
+        pool_small_blocking if pool_small_blocking is not None else pd.DataFrame(),
+        test_small, cfg)
     artifacts += R["casebook"].get("artifacts", [])
 
+    # 11. sampling disclosure + summary
+    R["sampling"] = {
+        "fast_mode": bool(cfg.eda.get("fast_mode", False)),
+        "sampling_config": dict(_sampling_cfg(cfg)),
+        "actual": dict(actual),
+        "collisions_aggressive_actual": dict(
+            R.get("collisions", {}).get("aggressive_actual", {})),
+        "full_data_sections": [
+            "dataset audit (01)", "ground-truth counts (02)",
+            "raw + conservative collisions (05)",
+            "country counts + missing rates (08)"],
+        "sampled_sections": [
+            "positive features (03)", "hard negatives (04)",
+            "aggressive collisions (05 __sample*)",
+            "blocking (06/07)", "country stats/vocab (08 n_sampled)",
+            "candidate graph (09)"],
+    }
     meta = dict(run_meta or {})
     meta["artifacts"] = sorted(set(artifacts))
     summary_path = generate_summary_md(R, cfg, meta)

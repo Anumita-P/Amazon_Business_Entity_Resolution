@@ -142,6 +142,18 @@ Deterministic via fixed seeds (`config/config.yaml: eda.random_seed`); offline.
 
 Open the casebook by double-clicking the HTML file (works offline — no CDNs).
 
+### Scale & sampling (why EDA stays fast on 2.2M S1 / 7.6M pairs)
+
+- **FULL-data:** audit (01), ground-truth counts (02, vectorized), raw + conservative
+  collisions (05), country counts + missing rates (08).
+- **SAMPLED (closed world, forced truth):** positive features (03), hard negatives (04),
+  aggressive collisions (05 `aggr_*__sample*` rows), blocking (06/07), country string-stats
+  + vocab coverage (08 `n_sampled`), graph (09). Sampled pools always contain every anchor's
+  true matches; every sampled artifact records its sample size.
+- Sizes live in `config/config.yaml: eda.sampling`; `reports/eda_summary.md` has a
+  **Sampling & scale** disclosure section. Quick smoke run:
+  `python scripts/run_eda.py --data-root dataset --fast-mode` (~5x smaller samples).
+
 ## 8–10. Experiment logging workflow (3 people / 3 days / 5 submissions)
 
 Full rules: [`logs/README.md`](logs/README.md). Short version:
