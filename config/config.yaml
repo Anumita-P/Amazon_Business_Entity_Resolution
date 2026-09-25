@@ -1,0 +1,94 @@
+# =====================================================================
+# Business Entity Resolution — Amazon ML Challenge 2026
+# Stage 1 configuration: dataset audit + entity-resolution EDA
+# ---------------------------------------------------------------------
+# The dataset location is configurable and is NEVER hard-coded:
+#   1. CLI flag    : python scripts/run_eda.py --data-root "D:\path\to\dataset"
+#   2. Env var     : BER_DATA_ROOT="D:\path\to\dataset"
+#   3. This file   : data_root below (default: dataset/ relative to repo root)
+# Precedence: CLI flag > environment variable > this file.
+# =====================================================================
+
+seed: 42
+data_root: "dataset"
+
+outputs:
+  eda_dir: "eda"
+  figures_dir: "eda/figures"
+  reports_dir: "reports"
+  logs_dir: "logs"
+  output_dir: "output"
+
+columns:
+  entity_id: "entity_id"
+  business_name: "business_name"
+  business_address: "business_address"
+  country: "country"
+  gt_source1: "source1_entity_id"
+  gt_matched: "matched_entity_ids"
+
+# Expected ID prefixes per table. Used for validation only.
+id_prefixes:
+  train_source1: "S1-"
+  train_source2: "S2-"
+  train_source3: "S3-"
+  test_source1: "S1-"
+  test_source2: "S2-"
+  test_source3: "S3-"
+
+eda:
+  random_seed: 42
+
+  # ---- Negative sampling (Stage 1 diagnostics) ----
+  negatives:
+    n_random: 3000        # random (s1, candidate) negatives
+    n_name_hard: 3000     # top name-retrieval neighbours that are NOT matches
+    n_address_hard: 3000  # top address-retrieval neighbours that are NOT matches
+    n_hybrid_hard: 2000   # top combined name+address neighbours that are NOT matches
+    retrieval_topk: 20    # top-k neighbours pulled per S1 when mining hard negatives
+    max_s1_for_mining: 4000  # cap S1 anchors mined (speed); null = all
+
+  # ---- Retrieval / blocking diagnostics ----
+  retrieval:
+    # char TF-IDF is intentionally language-agnostic (works for unseen France too)
+    analyzer: "char_wb"
+    ngram_min: 3
+    ngram_max: 5
+    max_features: 60000
+    sublinear_tf: true
+    name_topk: [20, 50]
+    address_topk: [20, 50]
+    query_chunk_size: 2000   # S1 queries scored per chunk (bounds memory)
+    rare_token_max_df: 25    # a name token is "rare" if seen in <= this many records
+    rare_token_min_len: 4    # ignore very short tokens for the rare-token blocker
+
+  blocking:
+    # Which diagnostic blockers to evaluate (union is always added automatically)
+    enabled:
+      - "exact_norm_name"
+      - "exact_rare_name_token"
+      - "exact_postcode"
+      - "name_tfidf_top20"
+      - "name_tfidf_top50"
+      - "address_tfidf_top20"
+      - "address_tfidf_top50"
+    max_candidates_per_s1_cap: 5000  # safety cap per S1 per blocker (diagnostics only)
+
+  # ---- Country shift ----
+  country_shift:
+    char_ngram_n: 3
+    max_vocab_chars: 4000000  # cap characters used when building n-gram vocabs
+
+  # ---- Casebook ----
+  casebook:
+    per_bucket: 25
+    low_name_threshold: 0.55     # "low name similarity" bucket cutoff (name_ratio)
+    low_address_threshold: 0.45  # "low address similarity" bucket cutoff (addr_token_jaccard)
+    high_neg_name_threshold: 0.80
+    high_neg_address_threshold: 0.60
+    boundary_lo: 0.45
+    boundary_hi: 0.65
+
+  figures:
+    dpi: 150
+    style: "seaborn-v0_8-whitegrid"

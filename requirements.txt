@@ -1,0 +1,12 @@
+# Business Entity Resolution — Amazon ML Challenge 2026 (Stage 1: EDA)
+# Pinned, Windows-wheel-friendly versions (Python >= 3.10).
+# Newer patch versions of the same packages should also work.
+pandas==2.2.2
+numpy==1.26.4
+matplotlib==3.8.4
+seaborn==0.13.2
+scipy==1.13.1
+scikit-learn==1.5.1
+rapidfuzz==3.9.1
+PyYAML==6.0.1
+jupyter==1.0.0

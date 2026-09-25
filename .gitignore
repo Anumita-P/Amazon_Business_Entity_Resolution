@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+# ---- Virtual envs ----
+.venv/
+venv/
+ENV/
+# ---- Jupyter ----
+.ipynb_checkpoints/
+# ---- OS / IDE ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# ---- Competition data (large, local only — never commit) ----
+# Copy/symlink the challenge `dataset/` folder into the project root to run.
+dataset/
+data/dataset/
+*.tsv
+!logs/experiment_log.csv
+# ---- Local outputs ----
+# EDA artifacts under eda/ ARE tracked (they are small team deliverables).
+# Final model outputs are local until a submission is made.
+output/*
+!output/.gitkeep
+# ---- Misc ----
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

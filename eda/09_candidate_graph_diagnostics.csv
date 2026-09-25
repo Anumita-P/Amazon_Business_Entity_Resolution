@@ -1,0 +1,60 @@
+section,group,metric,value
+s1_degree,all,n_s1,300
+s1_degree,all,mean,155.57
+s1_degree,all,p50,153.5
+s1_degree,all,p95,191.0
+s1_degree,all,max,198
+s1_degree,all,n_zero,0
+cand_degree,all,n_candidates_with_edges,553
+cand_degree,all,n_pool_total,553
+cand_degree,all,mean,84.396
+cand_degree,all,p95,108.0
+cand_degree,all,max,132
+edges,all,n_edges,46671
+edges,all,truncated_s1_for_graph,0
+s1_degree_by_country,India,mean,154.736
+s1_degree_by_country,India,max,198
+s1_degree_by_country,US,mean,156.3
+s1_degree_by_country,US,max,198
+cand_degree_by_source,S2,mean,84.835
+cand_degree_by_source,S2,max,132
+cand_degree_by_source,S3,mean,83.949
+cand_degree_by_source,S3,max,132
+cand_degree_by_country,India,mean,85.537
+cand_degree_by_country,India,max,128
+cand_degree_by_country,US,mean,83.391
+cand_degree_by_country,US,max,132
+hub_candidate,S3-00076,degree=132 src=S3 country=US,Sunrise Traders Co
+hub_candidate,S2-00164,degree=132 src=S2 country=US,Sunrise Cafe LLC
+hub_candidate,S3-00106,degree=128 src=S3 country=India,Royal Hotel LLC
+hub_candidate,S3-00014,degree=128 src=S3 country=India,Green Hotel LLC
+hub_candidate,S2-00119,degree=128 src=S2 country=India,Royal Hotel LLC
+hub_candidate,S3-00105,degree=128 src=S3 country=India,Royal Hotel LLC
+hub_candidate,S3-00116,degree=127 src=S3 country=India,City Motors Corporation
+hub_candidate,S3-00011,degree=126 src=S3 country=US,Royal Traders Co
+hub_candidate,S2-00187,degree=119 src=S2 country=India,National Bakery Corporation
+hub_candidate,S3-00187,degree=117 src=S3 country=India,Lucky Hotel
+hub_candidate,S2-00199,degree=117 src=S2 country=US,Metro Traders Inc
+hub_candidate,S2-00159,degree=116 src=S2 country=US,Royal Motors Inc
+hub_candidate,S3-00154,degree=115 src=S3 country=India,National Cafe LLC
+hub_candidate,S2-00027,degree=114 src=S2 country=US,National Bakery Inc
+hub_candidate,S2-00201,degree=113 src=S2 country=India,City Traders Inc
+hub_candidate,S3-00026,degree=113 src=S3 country=US,City Bakery Corporation
+hub_candidate,S3-00040,degree=112 src=S3 country=India,Lucky Cafe Co
+hub_candidate,S2-00096,degree=112 src=S2 country=US,City Cafe Corporation
+hub_candidate,S3-00234,degree=110 src=S3 country=US,Sunrise Motors
+hub_candidate,S2-00171,degree=110 src=S2 country=India,Lucky Traders Corporation
+hub_s1,S1-00176,degree=198 country=US,
+hub_s1,S1-00058,degree=198 country=India,
+hub_s1,S1-00290,degree=195 country=US,
+hub_s1,S1-00138,degree=194 country=India,
+hub_s1,S1-00265,degree=194 country=US,
+hub_s1,S1-00140,degree=193 country=US,
+hub_s1,S1-00027,degree=193 country=US,
+hub_s1,S1-00076,degree=192 country=US,
+hub_s1,S1-00213,degree=192 country=India,
+hub_s1,S1-00179,degree=192 country=US,
+components,all,n_components,1
+components,all,largest_component_nodes,853
+components,all,singleton_components,0
+components,rank_1,size_nodes,853
