@@ -1,0 +1,9 @@
+blocker,n_candidate_pairs,s1_s2_recall,s1_s3_recall,overall_recall,avg_candidates_per_s1,p50_candidates_per_s1,p95_candidates_per_s1,max_candidates_per_s1,candidate_burden,s1_with_zero_candidates,truncated_s1
+exact_norm_name,641,0.708543,0.779221,0.739377,1.885,2.0,6.0,7,0.00307552,70,0
+exact_rare_name_token,84,0.030151,0.0,0.016997,0.247,0.0,0.0,14,0.00040303,334,0
+exact_postcode,39466,0.864322,0.948052,0.90085,116.076,98.0,160.0,160,0.18935803,0,0
+name_tfidf_top20,6800,0.819095,0.88961,0.849858,20.0,20.0,20.0,20,0.03262643,0,0
+name_tfidf_top50,17000,0.869347,0.974026,0.915014,50.0,50.0,50.0,50,0.08156607,0,0
+address_tfidf_top20,6800,0.894472,0.993506,0.937677,20.0,20.0,20.0,20,0.03262643,0,0
+address_tfidf_top50,17000,0.899497,1.0,0.943343,50.0,50.0,50.0,50,0.08156607,0,0
+union_all,54908,0.904523,1.0,0.946176,161.494,160.0,205.05,217,0.26344881,0,0

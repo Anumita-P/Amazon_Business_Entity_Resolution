@@ -1,0 +1,7 @@
+source_pair,s1_country,cand_country,s1_script,cand_script,n_pairs,pct_of_source_pair,translit_exact_rate,translit_ratio_p50,name_exact_rate,name_ratio_p50
+S1_S2,US,US,Latin,Latin,91,0.457286,0.736264,1.0,0.736264,1.0
+S1_S2,India,India,Latin,Latin,68,0.341709,0.794118,1.0,0.794118,1.0
+S1_S2,India,India,Devanagari,Devanagari,20,0.100503,1.0,1.0,1.0,1.0
+S1_S2,India,India,Latin,Devanagari,20,0.100503,0.0,0.436179,0.0,0.108117
+S1_S3,US,US,Latin,Latin,80,0.519481,0.7,1.0,0.7,1.0
+S1_S3,India,India,Latin,Latin,74,0.480519,0.864865,1.0,0.864865,1.0

@@ -1,0 +1,14 @@
+script_bucket,class,n,word_jaccard_mean,word_jaccard_p50,token_set_p50,en_suffix_shared_rate,en_stopword_shared_rate,indic_suffix_shared_rate,stopword_only_overlap_rate,name_exact_rate
+cross_latin_deva,positive,20,0.0,0.0,0.118367,0.0,0.0,0.0,0.0,0.0
+cross_latin_deva,address_hard,2,0.0,0.0,0.109181,0.0,0.0,0.0,0.0,0.0
+cross_latin_deva,random,444,0.0,0.0,0.117647,0.0,0.0,0.0,0.0,0.0
+deva_deva,positive,20,1.0,1.0,1.0,0.0,0.0,0.0,0.0,1.0
+deva_deva,name_hard,160,0.500804,0.5,0.842432,0.0,0.0,0.0,0.0,0.025
+deva_deva,address_hard,158,0.279169,0.25,0.626786,0.0,0.0,0.0,0.0,0.0
+deva_deva,hybrid_hard,100,0.47554,0.464103,0.8,0.0,0.0,0.0,0.0,0.04
+deva_deva,random,24,0.269706,0.236111,0.60303,0.0,0.0,0.0,0.0,0.0
+latin_latin,positive,313,0.877902,1.0,1.0,0.738019,0.0,0.0,0.0,0.769968
+latin_latin,name_hard,2840,0.58229,0.5,0.888889,0.409155,0.0,0.0,0.0,0.132394
+latin_latin,address_hard,2840,0.085214,0.0,0.368421,0.128873,0.0,0.0,0.0,0.00493
+latin_latin,hybrid_hard,1900,0.494566,0.5,0.85,0.358947,0.0,0.0,0.0,0.126316
+latin_latin,random,2532,0.083537,0.0,0.375,0.123223,0.0,0.0,0.0,0.001975

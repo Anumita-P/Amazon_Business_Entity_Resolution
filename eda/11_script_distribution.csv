@@ -1,0 +1,85 @@
+source,field,script_category,row_count,percentage
+train_source1,business_name,Latin,320,0.941176
+train_source1,business_name,Devanagari,20,0.058824
+train_source1,business_name,Cyrillic,0,0.0
+train_source1,business_name,Arabic,0,0.0
+train_source1,business_name,mixed,0,0.0
+train_source1,business_name,other Unicode,0,0.0
+train_source1,business_name,empty/missing,0,0.0
+train_source1,business_address,Latin,320,0.941176
+train_source1,business_address,Devanagari,20,0.058824
+train_source1,business_address,Cyrillic,0,0.0
+train_source1,business_address,Arabic,0,0.0
+train_source1,business_address,mixed,0,0.0
+train_source1,business_address,other Unicode,0,0.0
+train_source1,business_address,empty/missing,0,0.0
+train_source2,business_name,Latin,279,0.823009
+train_source2,business_name,Devanagari,60,0.176991
+train_source2,business_name,Cyrillic,0,0.0
+train_source2,business_name,Arabic,0,0.0
+train_source2,business_name,mixed,0,0.0
+train_source2,business_name,other Unicode,0,0.0
+train_source2,business_name,empty/missing,0,0.0
+train_source2,business_address,Latin,279,0.823009
+train_source2,business_address,Devanagari,60,0.176991
+train_source2,business_address,Cyrillic,0,0.0
+train_source2,business_address,Arabic,0,0.0
+train_source2,business_address,mixed,0,0.0
+train_source2,business_address,other Unicode,0,0.0
+train_source2,business_address,empty/missing,0,0.0
+train_source3,business_name,Latin,274,1.0
+train_source3,business_name,Devanagari,0,0.0
+train_source3,business_name,Cyrillic,0,0.0
+train_source3,business_name,Arabic,0,0.0
+train_source3,business_name,mixed,0,0.0
+train_source3,business_name,other Unicode,0,0.0
+train_source3,business_name,empty/missing,0,0.0
+train_source3,business_address,Latin,274,1.0
+train_source3,business_address,Devanagari,0,0.0
+train_source3,business_address,Cyrillic,0,0.0
+train_source3,business_address,Arabic,0,0.0
+train_source3,business_address,mixed,0,0.0
+train_source3,business_address,other Unicode,0,0.0
+train_source3,business_address,empty/missing,0,0.0
+test_source1,business_name,Latin,120,1.0
+test_source1,business_name,Devanagari,0,0.0
+test_source1,business_name,Cyrillic,0,0.0
+test_source1,business_name,Arabic,0,0.0
+test_source1,business_name,mixed,0,0.0
+test_source1,business_name,other Unicode,0,0.0
+test_source1,business_name,empty/missing,0,0.0
+test_source1,business_address,Latin,120,1.0
+test_source1,business_address,Devanagari,0,0.0
+test_source1,business_address,Cyrillic,0,0.0
+test_source1,business_address,Arabic,0,0.0
+test_source1,business_address,mixed,0,0.0
+test_source1,business_address,other Unicode,0,0.0
+test_source1,business_address,empty/missing,0,0.0
+test_source2,business_name,Latin,100,1.0
+test_source2,business_name,Devanagari,0,0.0
+test_source2,business_name,Cyrillic,0,0.0
+test_source2,business_name,Arabic,0,0.0
+test_source2,business_name,mixed,0,0.0
+test_source2,business_name,other Unicode,0,0.0
+test_source2,business_name,empty/missing,0,0.0
+test_source2,business_address,Latin,100,1.0
+test_source2,business_address,Devanagari,0,0.0
+test_source2,business_address,Cyrillic,0,0.0
+test_source2,business_address,Arabic,0,0.0
+test_source2,business_address,mixed,0,0.0
+test_source2,business_address,other Unicode,0,0.0
+test_source2,business_address,empty/missing,0,0.0
+test_source3,business_name,Latin,100,1.0
+test_source3,business_name,Devanagari,0,0.0
+test_source3,business_name,Cyrillic,0,0.0
+test_source3,business_name,Arabic,0,0.0
+test_source3,business_name,mixed,0,0.0
+test_source3,business_name,other Unicode,0,0.0
+test_source3,business_name,empty/missing,0,0.0
+test_source3,business_address,Latin,100,1.0
+test_source3,business_address,Devanagari,0,0.0
+test_source3,business_address,Cyrillic,0,0.0
+test_source3,business_address,Arabic,0,0.0
+test_source3,business_address,mixed,0,0.0
+test_source3,business_address,other Unicode,0,0.0
+test_source3,business_address,empty/missing,0,0.0

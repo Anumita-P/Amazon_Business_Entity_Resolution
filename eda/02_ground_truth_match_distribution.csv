@@ -1,0 +1,17 @@
+breakdown,category,n_s1,pct_of_s1
+total_matches,1 match,154,0.452941
+total_matches,0 matches,100,0.294118
+total_matches,2 matches,59,0.173529
+total_matches,3 matches,27,0.079412
+s2_matches,0 matches,173,0.508824
+s2_matches,1 match,136,0.4
+s2_matches,2 matches,30,0.088235
+s2_matches,3 matches,1,0.002941
+s3_matches,0 matches,222,0.652941
+s3_matches,1 match,87,0.255882
+s3_matches,2 matches,26,0.076471
+s3_matches,3 matches,5,0.014706
+match_pattern,S2-only,122,0.358824
+match_pattern,singleton (no match),100,0.294118
+match_pattern,S3-only,73,0.214706
+match_pattern,mixed S2+S3,45,0.132353

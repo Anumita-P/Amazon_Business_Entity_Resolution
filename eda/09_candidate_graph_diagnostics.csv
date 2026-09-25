@@ -1,0 +1,60 @@
+section,group,metric,value
+s1_degree,all,n_s1,340
+s1_degree,all,mean,161.494
+s1_degree,all,p50,160.0
+s1_degree,all,p95,205.05
+s1_degree,all,max,217
+s1_degree,all,n_zero,0
+cand_degree,all,n_candidates_with_edges,613
+cand_degree,all,n_pool_total,613
+cand_degree,all,mean,89.573
+cand_degree,all,p95,119.4
+cand_degree,all,max,146
+edges,all,n_edges,54908
+edges,all,truncated_s1_for_graph,0
+s1_degree_by_country,India,mean,159.222
+s1_degree_by_country,India,max,214
+s1_degree_by_country,US,mean,164.05
+s1_degree_by_country,US,max,217
+cand_degree_by_source,S2,mean,87.378
+cand_degree_by_source,S2,max,143
+cand_degree_by_source,S3,mean,92.288
+cand_degree_by_source,S3,max,146
+cand_degree_by_country,India,mean,87.398
+cand_degree_by_country,India,max,142
+cand_degree_by_country,US,mean,91.932
+cand_degree_by_country,US,max,146
+hub_candidate,S3-00076,degree=146 src=S3 country=US,Sunrise Traders Co
+hub_candidate,S2-00164,degree=143 src=S2 country=US,Sunrise Cafe LLC
+hub_candidate,S3-00105,degree=142 src=S3 country=India,Royal Hotel LLC
+hub_candidate,S2-00119,degree=142 src=S2 country=India,Royal Hotel LLC
+hub_candidate,S3-00106,degree=141 src=S3 country=India,Royal Hotel LLC
+hub_candidate,S3-00014,degree=141 src=S3 country=India,Green Hotel LLC
+hub_candidate,S3-00011,degree=140 src=S3 country=US,Royal Traders Co
+hub_candidate,S3-00187,degree=131 src=S3 country=India,Lucky Hotel
+hub_candidate,S3-00116,degree=131 src=S3 country=India,City Motors Corporation
+hub_candidate,S3-00026,degree=128 src=S3 country=US,City Bakery Corporation
+hub_candidate,S2-00159,degree=128 src=S2 country=US,Royal Motors Inc
+hub_candidate,S2-00187,degree=128 src=S2 country=India,National Bakery Corporation
+hub_candidate,S2-00199,degree=127 src=S2 country=US,Metro Traders Inc
+hub_candidate,S2-00249,degree=126 src=S2 country=US,Green Hotel Pvt Ltd
+hub_candidate,S2-00027,degree=125 src=S2 country=US,National Bakery Inc
+hub_candidate,S3-00154,degree=125 src=S3 country=India,National Cafe LLC
+hub_candidate,S3-00234,degree=124 src=S3 country=US,Sunrise Motors
+hub_candidate,S2-00201,degree=124 src=S2 country=India,City Traders Inc
+hub_candidate,S2-00269,degree=124 src=S2 country=US,Sunrise Cafe LLC
+hub_candidate,S2-00140,degree=123 src=S2 country=US,RoyaltTextiles
+hub_s1,S1-00176,degree=217 country=US,
+hub_s1,S1-00265,degree=214 country=US,
+hub_s1,S1-00140,degree=214 country=US,
+hub_s1,S1-00138,degree=214 country=India,
+hub_s1,S1-00027,degree=213 country=US,
+hub_s1,S1-00076,degree=212 country=US,
+hub_s1,S1-00058,degree=212 country=India,
+hub_s1,S1-00231,degree=211 country=India,
+hub_s1,S1-00246,degree=210 country=US,
+hub_s1,S1-00047,degree=208 country=India,
+components,all,n_components,1
+components,all,largest_component_nodes,953
+components,all,singleton_components,0
+components,rank_1,size_nodes,953
