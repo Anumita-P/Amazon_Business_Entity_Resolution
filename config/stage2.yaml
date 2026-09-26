@@ -1,0 +1,53 @@
+# Stage 2 blocking-benchmark config (NEW file — config/config.yaml stays byte-identical).
+# Stage 2 = benchmark harness for candidate retrieval, NOT the final blocker.
+# Frozen Stage 1 interfaces (normalization v1, blocker defs, retrieval params) are read
+# from config/config.yaml at runtime; nothing here overrides them.
+
+seed: 42
+output_dir: "output/stage2"
+cache_dir: "output/stage2/cache"   # normalized-pool pickle cache (reruns); safe to delete
+history_path: "logs/stage2_history.jsonl"
+
+# ---- anchors (shared by every experiment in a run, so results are comparable) ----
+anchors:
+  n_anchors: 2000
+  matched_only: true        # recall needs GT positives; burden is still per-anchor
+  stratify_country: true    # proportional to eligible-anchor country mix
+  min_per_country: 300
+
+# ---- haystack ----
+haystack:
+  mode: "full"              # full | sample  (full = all train S2+S3, the primary benchmark)
+  sample_n: 1000000         # only used when mode=sample (small-machine fallback)
+  # NOTE: sampled haystacks do NOT force truth (unlike Stage 1 EDA pools).
+  # Recall is reported over ALL anchor positives + a pool_hit_rate ceiling column.
+
+candidate_cap_per_s1: 5000  # safety cap, mirrors the frozen diagnostic cap
+
+# ---- chunking (memory bounds; do not affect results) ----
+chunks:
+  query_chunk: 256
+  doc_chunk: 250000
+  dense_chunk: 50000
+
+# ---- exact sparse retrieval (scaled frozen TF-IDF; vectorizer params come from config.yaml) ----
+exact_topk_grid: [20, 50, 100]
+
+# ---- IVF ANN (SVD-dense + MiniBatchKMeans coarse quantizer + exact rescan) ----
+ivf:
+  svd_components: 128
+  svd_sample: 200000
+  n_clusters: 1024
+  minibatch_size: 10000
+  nprobe_grid: [1, 4, 8, 16]
+  topk_grid: [20, 50, 100]
+  max_scan_per_query: 100000  # safety cap on dense vectors rescanned per query
+
+# ---- experiments (run order; select a subset with --experiments) ----
+experiments:
+  - "EXP-001"   # frozen baseline reproduction (calls Stage 1 run_blocking_eda verbatim)
+  - "EXP-002"   # exact sparse name TF-IDF top-k on the large haystack
+  - "EXP-003"   # exact sparse address TF-IDF top-k on the large haystack
+  - "EXP-004"   # IVF ANN name (nprobe x topk grid) on the large haystack
+  - "EXP-005"   # IVF ANN address (nprobe x topk grid) on the large haystack
+  - "EXP-006"   # unions + full overlap/redundancy analysis on the large haystack

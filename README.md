@@ -193,22 +193,34 @@ python scripts/log_experiment.py --rerun EXP-003 --team-member Asha   :: rerun r
   `public_submission=yes`, `submission_number=1..5`, score filled in afterwards.
 - **Never edit/delete rows.** History is append-only.
 
-## 11. Intentionally NOT implemented yet (do not jump ahead)
+## 11. Stage 1 frozen; Stage 2 harness (benchmark, not final blocker)
 
-- Final multi-pass blocking pipeline (only blocker *diagnostics* exist)
+- **Stage 1 is FROZEN** — see `STAGE1_FREEZE.md` (baseline, blocker defs,
+  DO-NOT-CHANGE rules, Stage 2 interface). Full-run reports:
+  `reports/eda_full_run_report.md`, `reports/eda_fast_mode_report.md`.
+- **Stage 2** benchmarks candidate retrieval on the large haystack:
+  `python scripts/run_blocking_benchmark.py --data-root <dataset> --experiments all`
+  (config: `config/stage2.yaml`; outputs: `output/stage2/`; history:
+  `logs/stage2_history.jsonl`). Experiments: EXP-001 frozen-baseline
+  reproduction, EXP-002/003 exact sparse TF-IDF, EXP-004/005 IVF ANN,
+  EXP-006 unions + overlap/redundancy. Retrieval-only — no pair features,
+  no matcher, no ranking scores.
+
+## 12. Intentionally NOT implemented yet (do not jump ahead)
+
+- Final production blocking pipeline (only the Stage 2 *benchmark* exists)
 - Pair classifier (LightGBM/CatBoost), hard-negative training miner
 - Entity-level thresholding / macro-F0.5 optimization
 - Test inference, `output/matching_results.tsv`, `output/candidate_pairs.tsv`
 - Submission validator + final packaging
 
-`output/` stays empty until Stage 8/9.
+## 13. Roadmap
 
-## 12. Roadmap
-
-1. ✅ **EDA (here)** — audit, positives vs hard negatives, collisions, blocking
-   diagnostics, country shift, graph diagnostics, casebook
-2. Normalization + feature engineering (from EDA findings)
-3. Multi-pass blocking (recall ceiling + burden budget)
+1. ✅ **Stage 1 EDA (frozen)** — audit, positives vs hard negatives,
+   collisions, blocking diagnostics, country shift, multilingual, graph, casebook
+2. 🔄 **Stage 2 blocking benchmark (here)** — reproduce baseline, benchmark
+   exact + ANN retrieval and unions on the large haystack
+3. Production blocking (recall ceiling + burden budget, from Stage 2 evidence)
 4. Training-pair construction / hard negatives
 5. LightGBM/CatBoost pair classifier
 6. Entity-level thresholding (singleton abstention)
