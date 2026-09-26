@@ -1,0 +1,11 @@
+{
+  "frozen_union_recall": 0.987266,
+  "frozen_union_burden": 98.852,
+  "non_postcode_union_recall": 0.9871215135839091,
+  "runtime_seconds": 208.7993998999591,
+  "artifacts": [
+    "C:\\Users\\panum\\Downloads\\amazon\\workspace-01a0d847-6ca1-7271-a621-5ec3b9acc036\\business_entity_resolution\\output\\stage2\\exp001_frozen_baseline\\06_blocking_metrics.csv",
+    "C:\\Users\\panum\\Downloads\\amazon\\workspace-01a0d847-6ca1-7271-a621-5ec3b9acc036\\business_entity_resolution\\output\\stage2\\exp001_frozen_baseline\\07_blocking_positive_coverage.csv",
+    "C:\\Users\\panum\\Downloads\\amazon\\workspace-01a0d847-6ca1-7271-a621-5ec3b9acc036\\business_entity_resolution\\output\\stage2\\exp001_frozen_baseline\\figures\\blocking_recall_vs_burden.png"
+  ]
+}

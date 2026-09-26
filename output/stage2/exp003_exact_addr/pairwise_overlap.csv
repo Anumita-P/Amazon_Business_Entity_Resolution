@@ -1,0 +1,4 @@
+pair,n_both,n_a_only,n_b_only,jaccard
+exact_address_top20||exact_address_top50,5845,0,271,0.9556899934597777
+exact_address_top20||exact_address_top100,5845,0,412,0.9341537478024613
+exact_address_top50||exact_address_top100,6116,0,141,0.9774652389323957

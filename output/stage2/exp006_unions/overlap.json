@@ -1,0 +1,154 @@
+{
+  "n_positives": 7312,
+  "n_union_covered": 6877,
+  "union_coverage": 0.9405087527352297,
+  "n_missed_by_all": 435,
+  "n_hit_by_all": 74,
+  "n_hit_by_exactly_one": 0,
+  "unique_rescue_counts": {
+    "exact_norm_name": 0,
+    "exact_rare_name_token": 0,
+    "name_tfidf_top50": 0,
+    "address_tfidf_top50": 0,
+    "frozen_exact_union": 0,
+    "exact_tfidf_union_top50": 0,
+    "full_union_top50": 0
+  },
+  "unique_rescue_row_idx": {
+    "exact_norm_name": [],
+    "exact_rare_name_token": [],
+    "name_tfidf_top50": [],
+    "address_tfidf_top50": [],
+    "frozen_exact_union": [],
+    "exact_tfidf_union_top50": [],
+    "full_union_top50": []
+  },
+  "pairwise": {
+    "exact_norm_name||exact_rare_name_token": {
+      "n_both": 82,
+      "n_a_only": 1514,
+      "n_b_only": 211,
+      "jaccard": 0.04537908135030437
+    },
+    "exact_norm_name||name_tfidf_top50": {
+      "n_both": 1535,
+      "n_a_only": 61,
+      "n_b_only": 3297,
+      "jaccard": 0.313713468219906
+    },
+    "exact_norm_name||address_tfidf_top50": {
+      "n_both": 1354,
+      "n_a_only": 242,
+      "n_b_only": 4762,
+      "jaccard": 0.21296005033029256
+    },
+    "exact_norm_name||frozen_exact_union": {
+      "n_both": 1596,
+      "n_a_only": 0,
+      "n_b_only": 211,
+      "jaccard": 0.8832318760376314
+    },
+    "exact_norm_name||exact_tfidf_union_top50": {
+      "n_both": 1592,
+      "n_a_only": 4,
+      "n_b_only": 5280,
+      "jaccard": 0.2315299592786504
+    },
+    "exact_norm_name||full_union_top50": {
+      "n_both": 1596,
+      "n_a_only": 0,
+      "n_b_only": 5281,
+      "jaccard": 0.23207794096262904
+    },
+    "exact_rare_name_token||name_tfidf_top50": {
+      "n_both": 262,
+      "n_a_only": 31,
+      "n_b_only": 4570,
+      "jaccard": 0.05387620810199465
+    },
+    "exact_rare_name_token||address_tfidf_top50": {
+      "n_both": 253,
+      "n_a_only": 40,
+      "n_b_only": 5863,
+      "jaccard": 0.041098115659519166
+    },
+    "exact_rare_name_token||frozen_exact_union": {
+      "n_both": 293,
+      "n_a_only": 0,
+      "n_b_only": 1514,
+      "jaccard": 0.16214720531267293
+    },
+    "exact_rare_name_token||exact_tfidf_union_top50": {
+      "n_both": 292,
+      "n_a_only": 1,
+      "n_b_only": 6580,
+      "jaccard": 0.04248508657063873
+    },
+    "exact_rare_name_token||full_union_top50": {
+      "n_both": 293,
+      "n_a_only": 0,
+      "n_b_only": 6584,
+      "jaccard": 0.04260578740729969
+    },
+    "name_tfidf_top50||address_tfidf_top50": {
+      "n_both": 4076,
+      "n_a_only": 756,
+      "n_b_only": 2040,
+      "jaccard": 0.5931315483119907
+    },
+    "name_tfidf_top50||frozen_exact_union": {
+      "n_both": 1715,
+      "n_a_only": 3117,
+      "n_b_only": 92,
+      "jaccard": 0.34829406986190087
+    },
+    "name_tfidf_top50||exact_tfidf_union_top50": {
+      "n_both": 4832,
+      "n_a_only": 0,
+      "n_b_only": 2040,
+      "jaccard": 0.7031431897555297
+    },
+    "name_tfidf_top50||full_union_top50": {
+      "n_both": 4832,
+      "n_a_only": 0,
+      "n_b_only": 2045,
+      "jaccard": 0.7026319616111677
+    },
+    "address_tfidf_top50||frozen_exact_union": {
+      "n_both": 1533,
+      "n_a_only": 4583,
+      "n_b_only": 274,
+      "jaccard": 0.23990610328638498
+    },
+    "address_tfidf_top50||exact_tfidf_union_top50": {
+      "n_both": 6116,
+      "n_a_only": 0,
+      "n_b_only": 756,
+      "jaccard": 0.889988358556461
+    },
+    "address_tfidf_top50||full_union_top50": {
+      "n_both": 6116,
+      "n_a_only": 0,
+      "n_b_only": 761,
+      "jaccard": 0.8893412825359895
+    },
+    "frozen_exact_union||exact_tfidf_union_top50": {
+      "n_both": 1802,
+      "n_a_only": 5,
+      "n_b_only": 5070,
+      "jaccard": 0.2620328631670787
+    },
+    "frozen_exact_union||full_union_top50": {
+      "n_both": 1807,
+      "n_a_only": 0,
+      "n_b_only": 5070,
+      "jaccard": 0.2627599243856333
+    },
+    "exact_tfidf_union_top50||full_union_top50": {
+      "n_both": 6872,
+      "n_a_only": 0,
+      "n_b_only": 5,
+      "jaccard": 0.9992729387814454
+    }
+  }
+}

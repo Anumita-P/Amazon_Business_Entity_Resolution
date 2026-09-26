@@ -1,0 +1,5 @@
+{
+  "haystack_rows": 10320219,
+  "fit_seconds_shared": 459.8361321000266,
+  "vectorizer": "frozen char_wb 3-5 maxfeat=30000 sublinear"
+}

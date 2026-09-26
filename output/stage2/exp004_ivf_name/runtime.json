@@ -1,0 +1,20 @@
+{
+  "haystack_rows": 10320219,
+  "fit_seconds_shared": 629.3053600000567,
+  "svd_components": 128,
+  "n_clusters": 1024,
+  "scan_p50_by_blocker": {
+    "ivf_name_np1_top20": 14598.0,
+    "ivf_name_np1_top50": 14598.0,
+    "ivf_name_np1_top100": 14598.0,
+    "ivf_name_np4_top20": 52921.0,
+    "ivf_name_np4_top50": 52921.0,
+    "ivf_name_np4_top100": 52921.0,
+    "ivf_name_np8_top20": 96927.0,
+    "ivf_name_np8_top50": 96927.0,
+    "ivf_name_np8_top100": 96927.0,
+    "ivf_name_np16_top20": 100000.0,
+    "ivf_name_np16_top50": 100000.0,
+    "ivf_name_np16_top100": 100000.0
+  }
+}

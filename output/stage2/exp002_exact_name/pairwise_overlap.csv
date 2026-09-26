@@ -1,0 +1,4 @@
+pair,n_both,n_a_only,n_b_only,jaccard
+exact_name_top20||exact_name_top50,4322,4,510,0.8937138130686518
+exact_name_top20||exact_name_top100,4326,0,793,0.845086931041219
+exact_name_top50||exact_name_top100,4827,5,292,0.9420374707259953

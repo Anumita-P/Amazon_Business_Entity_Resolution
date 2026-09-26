@@ -1,0 +1,20 @@
+{
+  "haystack_rows": 10320219,
+  "fit_seconds_shared": 892.1878637999762,
+  "svd_components": 128,
+  "n_clusters": 1024,
+  "scan_p50_by_blocker": {
+    "ivf_address_np1_top20": 12876.0,
+    "ivf_address_np1_top50": 12876.0,
+    "ivf_address_np1_top100": 12876.0,
+    "ivf_address_np4_top20": 53528.0,
+    "ivf_address_np4_top50": 53528.0,
+    "ivf_address_np4_top100": 53528.0,
+    "ivf_address_np8_top20": 98911.0,
+    "ivf_address_np8_top50": 98911.0,
+    "ivf_address_np8_top100": 98911.0,
+    "ivf_address_np16_top20": 100000.0,
+    "ivf_address_np16_top50": 100000.0,
+    "ivf_address_np16_top100": 100000.0
+  }
+}
