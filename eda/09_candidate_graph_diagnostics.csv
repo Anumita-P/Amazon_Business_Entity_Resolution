@@ -1,0 +1,69 @@
+section,group,metric,value
+s1_degree,all,n_s1,8000
+s1_degree,all,mean,98.852
+s1_degree,all,p50,98.0
+s1_degree,all,p95,107.0
+s1_degree,all,max,131
+s1_degree,all,n_zero,0
+cand_degree,all,n_candidates_with_edges,205375
+cand_degree,all,n_pool_total,276961
+cand_degree,all,mean,3.851
+cand_degree,all,p95,12.0
+cand_degree,all,max,174
+edges,all,n_edges,790813
+edges,all,truncated_s1_for_graph,0
+s1_degree_by_country,India,mean,99.11
+s1_degree_by_country,India,max,123
+s1_degree_by_country,US,mean,98.677
+s1_degree_by_country,US,max,131
+cand_degree_by_source,S2,mean,4.325
+cand_degree_by_source,S2,max,174
+cand_degree_by_source,S3,mean,3.337
+cand_degree_by_source,S3,max,130
+cand_degree_by_country,India,mean,4.448
+cand_degree_by_country,India,max,174
+cand_degree_by_country,US,mean,3.511
+cand_degree_by_country,US,max,63
+hub_candidate,S2-183159151,degree=174 src=S2 country=India,Private Amrawati Agro Limited
+hub_candidate,S2-53581829,degree=173 src=S2 country=India,स्काई कंसल्टेंट्स प्रा. लि.
+hub_candidate,S2-586301731,degree=171 src=S2 country=India,Yumazetaxylo
+hub_candidate,S2-776717772,degree=167 src=S2 country=India,Vbdargha Web LLP
+hub_candidate,S2-382073429,degree=166 src=S2 country=India,सनराइज प्रॉपर्टीज प्राइवेट लिमिटेड
+hub_candidate,S2-797397075,degree=164 src=S2 country=India,परफेक्ट इंडस्ट्रीज प्राइवेट लिमिटेड
+hub_candidate,S2-942530516,degree=150 src=S2 country=India,ominvestment.com
+hub_candidate,S2-384401315,degree=149 src=S2 country=India,माँ मैनेजमेंट मोटर्स लिमिटेड
+hub_candidate,S2-849450184,degree=145 src=S2 country=India,गैलेक्सी इम्पेक्स प्राइवेट लिमिटेड
+hub_candidate,S2-344027832,degree=143 src=S2 country=India,बिग न्यू एनर्जी प्राइवेट लिमिटेड
+hub_candidate,S2-379987770,degree=139 src=S2 country=India,Private Bangalore Support Límited
+hub_candidate,S2-681423767,degree=138 src=S2 country=India,ಗ್ರೇಟ್ ಇಂಟರ್‌ನ್ಯಾಷನಲ್ ಪ್ರೈವೇಟ್ ಲಿಮಿಟೆಡ್
+hub_candidate,S2-712416068,degree=133 src=S2 country=India,JXS (I) Private Limited
+hub_candidate,S2-434652275,degree=130 src=S2 country=India,PRRVAAE MUMBAI DISTRIBUTION LIMITED
+hub_candidate,S2-582064267,degree=130 src=S2 country=India,हाई एनर्जी एलएलपी
+hub_candidate,S3-679646212,degree=130 src=S3 country=India,ਸ਼ਕਤੀ ਐਗਰੋ Private Limited
+hub_candidate,S2-846203430,degree=130 src=S2 country=India,ಆಲ್ ಪ್ರಾಪರ್ಟೀಸ್ ಪ್ರೈವೇಟ್ ಲಿಮಿಟೆಡ್
+hub_candidate,S2-781320064,degree=129 src=S2 country=India,Pvt QY Nidhi Ltd
+hub_candidate,S2-440897921,degree=128 src=S2 country=India,लोटस इंडियन एनर्जी प्राइवेट लिमिटेड
+hub_candidate,S2-328319600,degree=127 src=S2 country=India,Limited My Builders
+hub_s1,S1-444877932,degree=131 country=US,
+hub_s1,S1-765027384,degree=128 country=US,
+hub_s1,S1-734616168,degree=127 country=US,
+hub_s1,S1-702036349,degree=125 country=US,
+hub_s1,S1-209470493,degree=124 country=US,
+hub_s1,S1-363061859,degree=123 country=India,
+hub_s1,S1-896728274,degree=123 country=US,
+hub_s1,S1-457360967,degree=123 country=US,
+hub_s1,S1-571401281,degree=123 country=US,
+hub_s1,S1-356276396,degree=121 country=US,
+components,all,n_components,71587
+components,all,largest_component_nodes,213375
+components,all,singleton_components,71586
+components,rank_1,size_nodes,213375
+components,rank_2,size_nodes,1
+components,rank_3,size_nodes,1
+components,rank_4,size_nodes,1
+components,rank_5,size_nodes,1
+components,rank_6,size_nodes,1
+components,rank_7,size_nodes,1
+components,rank_8,size_nodes,1
+components,rank_9,size_nodes,1
+components,rank_10,size_nodes,1

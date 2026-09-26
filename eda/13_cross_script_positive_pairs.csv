@@ -1,0 +1,11 @@
+source_pair,s1_country,cand_country,s1_script,cand_script,n_pairs,pct_of_source_pair,translit_exact_rate,translit_ratio_p50,name_exact_rate,name_ratio_p50
+S1_S2,US,US,Latin,Latin,8730,0.601115,0.180641,0.809524,0.254754,0.9
+S1_S2,India,India,Latin,Latin,4417,0.304138,0.106181,0.78481,0.199683,0.875
+S1_S2,India,India,Latin,Devanagari,770,0.053019,0.0,0.526316,0.0,0.1
+S1_S2,India,India,Latin,other Unicode,535,0.036838,0.0,0.09375,0.0,0.098361
+S1_S2,India,India,Latin,mixed,71,0.004889,0.014085,0.7,0.0,0.548387
+S1_S3,US,US,Latin,Latin,9328,0.602701,0.176565,0.860935,0.261042,0.896552
+S1_S3,India,India,Latin,Latin,5368,0.346837,0.11494,0.835493,0.189642,0.857143
+S1_S3,India,India,Latin,Devanagari,401,0.025909,0.0,0.527778,0.0,0.101695
+S1_S3,India,India,Latin,other Unicode,288,0.018608,0.0,0.091608,0.0,0.096774
+S1_S3,India,India,Latin,mixed,92,0.005944,0.0,0.722069,0.0,0.560505
