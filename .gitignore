@@ -26,6 +26,9 @@ data/dataset/
 # Final model outputs are local until a submission is made.
 output/*
 !output/.gitkeep
+# Stage 2 benchmark cache: multi-GB regenerable files (pool pickle, IVF memmaps).
+# Never commit; results live in output/stage2/exp*/ (force-added to outputs branches).
+output/stage2/cache/
 # ---- Misc ----
 *.log
 .pytest_cache/
