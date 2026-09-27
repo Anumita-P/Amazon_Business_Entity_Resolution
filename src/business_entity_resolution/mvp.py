@@ -155,21 +155,27 @@ class TwoStageRetrieval:
         prefilter_min_union: int = 3000, prefilter_max_postings: int = 300000,
         chunk: int = 2000, n_threads: int = 1,
     ) -> pd.DataFrame:
-        """Top-k pairs (PAIRS ONLY). Threaded over query spans; order-stable."""
-        qmat_all = self.char_vec.transform(query_texts).astype(np.float32).tocsr()
+        """Top-k pairs (PAIRS ONLY). Threaded over query spans; order-stable.
+
+        The char n-gram query matrix is transformed PER SPAN inside workers
+        (never the full query set upfront), so peak RAM stays flat at any
+        test scale; values are identical either way.
+        """
         n = len(query_texts)
         t0 = time.perf_counter()
         spans = [(s, min(n, s + chunk)) for s in range(0, n, chunk)]
 
         def _work(se: Tuple[int, int]) -> List[Tuple[str, str]]:
             s, e = se
+            qmat = self.char_vec.transform(
+                query_texts[s:e]).astype(np.float32).tocsr()
             out: List[Tuple[str, str]] = []
-            for qi in range(s, e):
+            for li, qi in enumerate(range(s, e)):
                 cand = self._prefilter_rows(query_texts[qi], prefilter_min_union,
                                             prefilter_max_postings)
                 if len(cand) == 0:
                     continue
-                sims = (qmat_all[qi] @ self.char_csr[cand].T).toarray().ravel()
+                sims = (qmat[li] @ self.char_csr[cand].T).toarray().ravel()
                 take = min(k, len(cand))
                 part = np.argpartition(-sims, take - 1)[:take]
                 for j in cand[part]:
@@ -441,9 +447,13 @@ def predictions_to_lists(
 
 def validate_submission(
     matching: pd.DataFrame, candidates: pd.DataFrame, test_s1_ids: List[str],
-    pool_ids: set,
+    pool_ids: set, cand_path=None, cand_chunksize: int = 2000000,
 ) -> List[str]:
-    """Return a list of problems (empty = valid)."""
+    """Return a list of problems (empty = valid).
+
+    ``cand_path`` streams the candidate TSV in chunks instead of holding it
+    in RAM (same pool-membership check); ``candidates`` may then be None.
+    """
     problems: List[str] = []
     want = [str(a) for a in test_s1_ids]
     if matching["source1_entity_id"].astype(str).tolist() != want:
@@ -457,9 +467,18 @@ def validate_submission(
                 bad += 1
     if bad:
         problems.append(f"{bad} matched ids not in the test pool.")
-    if candidates["source1_entity_id"].duplicated().any():
-        pass  # candidates are long-format; dup S1 expected
-    cands_bad = (~candidates["candidate_entity_id"].astype(str).isin(pool_ids)).sum()
+    if cand_path is not None:
+        cands_bad = 0
+        for ch in pd.read_csv(cand_path, sep="\t", dtype=str,
+                              chunksize=cand_chunksize,
+                              usecols=["candidate_entity_id"]):
+            cands_bad += int((~ch["candidate_entity_id"].astype(str).isin(
+                pool_ids)).sum())
+    else:
+        if candidates["source1_entity_id"].duplicated().any():
+            pass  # candidates are long-format; dup S1 expected
+        cands_bad = (~candidates["candidate_entity_id"].astype(str).isin(
+            pool_ids)).sum()
     if cands_bad:
         problems.append(f"{cands_bad} candidate ids not in the test pool.")
     return problems

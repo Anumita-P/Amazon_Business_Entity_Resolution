@@ -15,6 +15,7 @@ import argparse
 import gc
 import json
 import logging
+from concurrent.futures import ProcessPoolExecutor
 import sys
 import time
 from datetime import datetime, timezone
@@ -115,6 +116,49 @@ def _retrieve_all(s1_df, pool_df, cols, cfg, rcfg, tag, topk=None,
     return pairs, info
 
 
+def _save_pairs_npz(path, df):
+    """Transient per-chunk pair part (uncompressed npz: fast, exact)."""
+    if len(df):
+        s1 = df["source1_entity_id"].astype(str).to_numpy()
+        cd = df["candidate_entity_id"].astype(str).to_numpy()
+    else:
+        s1 = np.zeros(0, dtype="U1")
+        cd = np.zeros(0, dtype="U1")
+    np.savez(path, s1=s1, cand=cd)
+
+
+def _load_pairs_npz(path):
+    z = np.load(path, allow_pickle=True)
+    return pd.DataFrame({"source1_entity_id": z["s1"].astype(str),
+                         "candidate_entity_id": z["cand"].astype(str)})
+
+
+def _route_pairs_to_chunks(df, all_s1, tchunk, parts_dir, prefix):
+    """Split full-test-S1 exact pairs into per-chunk part files (stable).
+
+    Exact nets computed once over ALL test S1 yield exactly the union of
+    per-chunk computations (pool DFs are chunk-independent), so routing by
+    S1 position preserves pair SETS while the pool is scanned only once.
+    """
+    n_chunks = (len(all_s1) + tchunk - 1) // tchunk
+    if df.empty:
+        for ci in range(n_chunks):
+            _save_pairs_npz(parts_dir / f"{prefix}_{ci:04d}.npz", df.iloc[0:0])
+        return
+    pos = pd.Series(np.arange(len(all_s1)), index=pd.Index(all_s1))
+    codes = pos.reindex(df["source1_entity_id"].astype(str)).to_numpy()
+    if np.isnan(codes).any():
+        raise ValueError(f"{prefix}: pair s1 outside test list")
+    ch = (codes // tchunk).astype(np.int64)
+    order = np.argsort(ch, kind="stable")
+    bounds = np.searchsorted(ch[order], np.arange(n_chunks + 1))
+    for ci in range(n_chunks):
+        sl = df.iloc[order[bounds[ci]:bounds[ci + 1]]]
+        _save_pairs_npz(parts_dir / f"{prefix}_{ci:04d}.npz", sl)
+    logger.info("infer: %s pairs=%d routed to %d chunks", prefix, len(df),
+                n_chunks)
+
+
 def _history(logs_dir, record):
     p = Path(logs_dir) / "mvp_history.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -178,8 +222,11 @@ def main() -> int:
         va_df = normalize_frame(
             s1_raw.loc[s1_raw[c_id].astype(str).isin(set(va_ids))].copy(), cols)
 
-        tr_pairs, _ = _retrieve_all(tr_df, pool, cols, cfg, rcfg, "train")
-        va_pairs, _ = _retrieve_all(va_df, pool, cols, cfg, rcfg, "valid")
+        r_threads = int(rcfg.get("n_threads", 1))
+        tr_pairs, _ = _retrieve_all(tr_df, pool, cols, cfg, rcfg, "train",
+                                    n_threads=r_threads)
+        va_pairs, _ = _retrieve_all(va_df, pool, cols, cfg, rcfg, "valid",
+                                    n_threads=r_threads)
         # retrieval recall check on valid anchors (same yardstick as Stage 2)
         va_pos = anchor_truth_to_basic({a: t for a, t in va_truth.items() if t})
         va_cty = dict(zip(s1_raw[c_id].astype(str),
@@ -301,53 +348,126 @@ def main() -> int:
                 len(pool), thr)
     tchunk = int(icfg.get("test_chunk", 50000))
     threads = int(icfg.get("threads", 8))
+    r_threads = int(rcfg.get("n_threads", 1))
+    n_procs = int(icfg.get("processes", 0))
+    proc_rows = int(icfg.get("proc_task_rows", 25000))
+    topk = int(rcfg.get("topk", 50))
+    min_union = int(rcfg.get("prefilter_min_union", 3000))
+    max_post = int(rcfg.get("prefilter_max_postings", 300000))
+    max_wf = int(rcfg.get("max_word_features", 2000000))
+    n_chunks = (len(all_s1) + tchunk - 1) // tchunk
+    part_prefixes = ["name", "address"]
     scored_dir = out_dir / "scored_chunks"
+    parts_dir = out_dir / "parts"
     scored_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for stale in list(scored_dir.glob("scored_*.npz")) + \
+            list(parts_dir.glob("*.npz")):
+        stale.unlink()  # transient artifacts: never mix runs
+    # phases 1-2: fit each field ONCE, query per test chunk -> part files
+    for field in ("name", "address"):
+        idx = TwoStageRetrieval().fit(
+            pool[f"{field}_norm"].astype(str).tolist(),
+            pool_ids, cfg, max_word_features=max_wf)
+        texts = s1_test_n[f"{field}_norm"].astype(str).tolist()
+        qtime = 0.0
+        for ci in range(n_chunks):
+            cs, ce = ci * tchunk, min(len(all_s1), (ci + 1) * tchunk)
+            q = idx.query(texts[cs:ce], all_s1[cs:ce], topk, min_union,
+                          max_post, n_threads=r_threads)
+            qtime += idx.last_query_seconds
+            _save_pairs_npz(parts_dir / f"{field}_{ci:04d}.npz", q)
+            del q
+            gc.collect()
+        logger.info("infer: field %s queried in %.0fs total", field, qtime)
+        del idx, texts
+        gc.collect()
+    # phase 3: frozen exact nets ONCE on full test S1, routed to chunks
+    if rcfg.get("include_exact_name", True):
+        en = exact_name_pairs(s1_test_n, pool, cols)
+        _route_pairs_to_chunks(en, all_s1, tchunk, parts_dir, "exact_name")
+        part_prefixes.append("exact_name")
+        del en
+        gc.collect()
+    if rcfg.get("include_exact_rare", True):
+        ret = cfg.eda.get("retrieval", {})
+        er = exact_rare_token_pairs(
+            s1_test_n, pool, cols,
+            rare_max_df=int(ret.get("rare_token_max_df", 25)),
+            rare_min_len=int(ret.get("rare_token_min_len", 4)))
+        _route_pairs_to_chunks(er, all_s1, tchunk, parts_dir, "exact_rare")
+        part_prefixes.append("exact_rare")
+        del er
+        gc.collect()
+    # phase 4: union -> candidates TSV -> featurize -> predict -> scored npz
     cand_path = out_dir / "candidate_pairs.tsv"
     if cand_path.exists():
         cand_path.unlink()
     first = True
-    for cs in range(0, len(all_s1), tchunk):
-        ce = min(len(all_s1), cs + tchunk)
-        chunk_df = s1_test_n.iloc[cs:ce].reset_index(drop=True)
-        logger.info("infer chunk %d-%d/%d", cs, ce, len(all_s1))
-        pairs, _ = _retrieve_all(chunk_df, pool, cols, cfg, rcfg,
-                                 f"infer[{cs}:{ce}]")
-        pairs[["source1_entity_id", "candidate_entity_id"]].to_csv(
-            cand_path, sep="\t", index=False, header=first, mode="a")
-        first = False
-        # featurize+predict in row chunks
-        fch = int(icfg.get("feature_chunk_rows", 200000))
-        s_ids, c_rows, sc = [], [], []
-        for rs in range(0, len(pairs), fch):
-            sub = pairs.iloc[rs:rs + fch].reset_index(drop=True)
-            fz = featurize_pairs(sub, chunk_df, pool, cols, threads)
-            pr = model.predict_proba(
-                fz[ALL_FEATURE_COLUMNS].to_numpy(dtype=np.float32))[:, 1]
-            s_ids.append(fz["source1_entity_id"].to_numpy())
-            c_rows.append(np.array([prow_of[c] for c in
-                                    fz["candidate_entity_id"].astype(str)],
-                                   dtype=np.int32))
-            sc.append(pr.astype(np.float32))
-            del fz, pr
+    n_cands_total = 0
+    fch = int(icfg.get("feature_chunk_rows", 200000))
+    ex = ProcessPoolExecutor(max_workers=n_procs) if n_procs > 0 else None
+    if ex is not None:
+        logger.info("infer: process-pool featurizer with %d workers", n_procs)
+    try:
+        for ci in range(n_chunks):
+            cs, ce = ci * tchunk, min(len(all_s1), (ci + 1) * tchunk)
+            chunk_ids = all_s1[cs:ce]
+            chunk_df = s1_test_n.iloc[cs:ce].reset_index(drop=True)
+            logger.info("infer chunk %d-%d/%d", cs, ce, len(all_s1))
+            frames = [_load_pairs_npz(parts_dir / f"{p}_{ci:04d}.npz")
+                      for p in part_prefixes]
+            pairs = pd.concat(frames, ignore_index=True).drop_duplicates(
+                ).reset_index(drop=True)
+            del frames
+            n_cands_total += len(pairs)
+            logger.info("infer[%d:%d]: union=%d pairs (%.1f/S1)", cs, ce,
+                        len(pairs), len(pairs) / max(1, len(chunk_ids)))
+            pairs[["source1_entity_id", "candidate_entity_id"]].to_csv(
+                cand_path, sep="\t", index=False, header=first, mode="a")
+            first = False
+            cidx = pd.Index(chunk_ids)
+            s_ids, c_rows, sc = [], [], []
+            for rs in range(0, len(pairs), fch):
+                sub = pairs.iloc[rs:rs + fch].reset_index(drop=True)
+                fz = featurize_pairs(sub, chunk_df, pool, cols, threads,
+                                     executor=ex, proc_task_rows=proc_rows)
+                pr = model.predict_proba(
+                    fz[ALL_FEATURE_COLUMNS].to_numpy(dtype=np.float32))[:, 1]
+                # compact global S1 positions (int32) instead of id strings
+                gpos = cidx.get_indexer(
+                    fz["source1_entity_id"].astype(str)) + cs
+                assert (gpos >= 0).all(), "pair s1 outside its test chunk"
+                s_ids.append(gpos.astype(np.int32))
+                c_rows.append(np.array(
+                    [prow_of[c] for c in
+                     fz["candidate_entity_id"].astype(str)], dtype=np.int32))
+                sc.append(pr.astype(np.float32))
+                del fz, pr
+                gc.collect()
+            if s_ids:
+                np.savez_compressed(
+                    scored_dir / f"scored_{cs:07d}_{ce:07d}.npz",
+                    s1=np.concatenate(s_ids),
+                    cand_row=np.concatenate(c_rows),
+                    score=np.concatenate(sc))
+            del pairs
             gc.collect()
-        if s_ids:
-            np.savez_compressed(
-                scored_dir / f"scored_{cs:07d}_{ce:07d}.npz",
-                s1=np.concatenate(s_ids),
-                cand_row=np.concatenate(c_rows),
-                score=np.concatenate(sc))
-        del pairs
-        gc.collect()
+    finally:
+        if ex is not None:
+            ex.shutdown()
     np.save(scored_dir / "pool_ids.npy", np.array(pool_ids))
     # threshold -> matching_results (streaming over scored chunks)
     lists: Dict[str, List[Tuple[float, str]]] = {a: [] for a in all_s1}
     for npz in sorted(scored_dir.glob("scored_*.npz")):
         z = np.load(npz, allow_pickle=True)
         s1a, cra, sca = z["s1"], z["cand_row"], z["score"]
-        for a, r, s in zip(s1a.tolist(), cra.tolist(), sca.tolist()):
-            if s >= thr:
-                lists[str(a)].append((float(s), pool_ids[int(r)]))
+        m = sca >= thr  # numpy prefilter: iterate only passing pairs
+        if not m.any():
+            continue
+        for g, r, s in zip(s1a[m].tolist(), cra[m].tolist(),
+                            sca[m].tolist()):
+            lists[all_s1[int(g)]].append((float(s), pool_ids[int(r)]))
     rows = []
     for a in all_s1:
         seen, ordered = set(), []
@@ -359,8 +479,9 @@ def main() -> int:
                      "matched_entity_ids": ",".join(ordered)})
     matching = pd.DataFrame(rows)
     matching.to_csv(out_dir / "matching_results.tsv", sep="\t", index=False)
-    cands = pd.read_csv(cand_path, sep="\t", dtype=str)
-    problems = validate_submission(matching, cands, all_s1, pool_set)
+    problems = validate_submission(
+        matching, None, all_s1, pool_set, cand_path=cand_path,
+        cand_chunksize=int(icfg.get("cand_validate_chunksize", 2000000)))
     n_pred = int((matching["matched_entity_ids"].astype(str) != "").sum())
     logger.info("SUBMISSION: rows=%d predicted-nonempty=%d empty=%d", len(matching),
                 n_pred, len(matching) - n_pred)
@@ -374,12 +495,12 @@ def main() -> int:
         _history(cfg.logs_dir, {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "mode": "infer", "git_commit": git_commit, "threshold": thr,
-            "n_test_s1": len(all_s1), "n_candidate_pairs": len(cands),
+            "n_test_s1": len(all_s1), "n_candidate_pairs": n_cands_total,
             "n_predicted_nonempty": n_pred})
     _log("MVP infer: submission at threshold %.3f" % thr,
          "First leaderboard submission.", "mvp-twostage-v1", "mvp-feats-v1",
          "see-train-row", "threshold=%.3f" % thr, thr, None, None, None,
-         f"s1={len(all_s1)} pairs={len(cands)} nonempty={n_pred}")
+         f"s1={len(all_s1)} pairs={n_cands_total} nonempty={n_pred}")
     return 0
 
 

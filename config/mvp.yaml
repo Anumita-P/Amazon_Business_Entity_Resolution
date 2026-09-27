@@ -19,9 +19,13 @@ retrieval:
   include_exact_name: true
   include_exact_rare: true
   warn_recall_below: 0.90           # warn if valid-anchor union recall < this
+  n_threads: 8                      # query-span threads (order-stable: same pairs)
 
 infer:
   test_chunk: 50000                 # S1 per chunk (bounds RAM)
   feature_chunk_rows: 200000
   threads: 8
   save_scored_chunks: true          # enables free threshold retuning
+  processes: 0                      # >0 => process-pool featurizer (spawn-safe); 0 = threads
+  proc_task_rows: 25000             # rows per process-pool task
+  cand_validate_chunksize: 2000000  # streaming candidate-TSV validation rows
