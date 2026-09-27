@@ -78,6 +78,8 @@ def parse_args(argv=None):
     ap.add_argument("--day", default="2")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--no-log", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="infer: reuse output-dir parts/ if manifest matches")
     return ap.parse_args(argv)
 
 
@@ -357,48 +359,76 @@ def main() -> int:
     max_wf = int(rcfg.get("max_word_features", 2000000))
     n_chunks = (len(all_s1) + tchunk - 1) // tchunk
     part_prefixes = ["name", "address"]
+    if rcfg.get("include_exact_name", True):
+        part_prefixes.append("exact_name")
+    if rcfg.get("include_exact_rare", True):
+        part_prefixes.append("exact_rare")
     scored_dir = out_dir / "scored_chunks"
     parts_dir = out_dir / "parts"
     scored_dir.mkdir(parents=True, exist_ok=True)
     parts_dir.mkdir(parents=True, exist_ok=True)
-    for stale in list(scored_dir.glob("scored_*.npz")) + \
-            list(parts_dir.glob("*.npz")):
-        stale.unlink()  # transient artifacts: never mix runs
-    # phases 1-2: fit each field ONCE, query per test chunk -> part files
-    for field in ("name", "address"):
-        idx = TwoStageRetrieval().fit(
-            pool[f"{field}_norm"].astype(str).tolist(),
-            pool_ids, cfg, max_word_features=max_wf)
-        texts = s1_test_n[f"{field}_norm"].astype(str).tolist()
-        qtime = 0.0
-        for ci in range(n_chunks):
-            cs, ce = ci * tchunk, min(len(all_s1), (ci + 1) * tchunk)
-            q = idx.query(texts[cs:ce], all_s1[cs:ce], topk, min_union,
-                          max_post, n_threads=r_threads)
-            qtime += idx.last_query_seconds
-            _save_pairs_npz(parts_dir / f"{field}_{ci:04d}.npz", q)
-            del q
+    manifest = {"topk": topk, "min_union": min_union, "max_post": max_post,
+                "max_wf": max_wf, "prefixes": part_prefixes,
+                "n_chunks": n_chunks, "n_test_s1": len(all_s1),
+                "first_s1": all_s1[0], "last_s1": all_s1[-1]}
+    man_path = parts_dir / "_manifest.json"
+    do_retrieval = True
+    if args.resume and man_path.exists():
+        try:
+            man = json.load(open(man_path, encoding="utf-8"))
+        except ValueError:
+            man = {}
+        want_files = [parts_dir / f"{p}_{ci:04d}.npz"
+                      for p in part_prefixes for ci in range(n_chunks)]
+        if man == manifest and all(f.exists() for f in want_files):
+            logger.info("infer: --resume manifest match; skipping phases 1-3 "
+                        "(%d part files reused)", len(want_files))
+            do_retrieval = False
+        else:
+            logger.info("infer: --resume mismatch (params/test/chunks differ "
+                        "or parts incomplete) — recomputing from scratch")
+    if do_retrieval:
+        for stale in list(scored_dir.glob("scored_*.npz")) + \
+                list(parts_dir.glob("*.npz")):
+            stale.unlink()  # transient artifacts: never mix runs
+        if man_path.exists():
+            man_path.unlink()
+        # phases 1-2: fit each field ONCE, query per test chunk -> part files
+        for field in ("name", "address"):
+            idx = TwoStageRetrieval().fit(
+                pool[f"{field}_norm"].astype(str).tolist(),
+                pool_ids, cfg, max_word_features=max_wf)
+            texts = s1_test_n[f"{field}_norm"].astype(str).tolist()
+            qtime = 0.0
+            for ci in range(n_chunks):
+                cs, ce = ci * tchunk, min(len(all_s1), (ci + 1) * tchunk)
+                q = idx.query(texts[cs:ce], all_s1[cs:ce], topk, min_union,
+                              max_post, n_threads=r_threads)
+                qtime += idx.last_query_seconds
+                _save_pairs_npz(parts_dir / f"{field}_{ci:04d}.npz", q)
+                del q
+                gc.collect()
+            logger.info("infer: field %s queried in %.0fs total", field, qtime)
+            del idx, texts
             gc.collect()
-        logger.info("infer: field %s queried in %.0fs total", field, qtime)
-        del idx, texts
-        gc.collect()
-    # phase 3: frozen exact nets ONCE on full test S1, routed to chunks
-    if rcfg.get("include_exact_name", True):
-        en = exact_name_pairs(s1_test_n, pool, cols)
-        _route_pairs_to_chunks(en, all_s1, tchunk, parts_dir, "exact_name")
-        part_prefixes.append("exact_name")
-        del en
-        gc.collect()
-    if rcfg.get("include_exact_rare", True):
-        ret = cfg.eda.get("retrieval", {})
-        er = exact_rare_token_pairs(
-            s1_test_n, pool, cols,
-            rare_max_df=int(ret.get("rare_token_max_df", 25)),
-            rare_min_len=int(ret.get("rare_token_min_len", 4)))
-        _route_pairs_to_chunks(er, all_s1, tchunk, parts_dir, "exact_rare")
-        part_prefixes.append("exact_rare")
-        del er
-        gc.collect()
+        # phase 3: frozen exact nets ONCE on full test S1, routed to chunks
+        if "exact_name" in part_prefixes:
+            en = exact_name_pairs(s1_test_n, pool, cols)
+            _route_pairs_to_chunks(en, all_s1, tchunk, parts_dir, "exact_name")
+            del en
+            gc.collect()
+        if "exact_rare" in part_prefixes:
+            ret = cfg.eda.get("retrieval", {})
+            er = exact_rare_token_pairs(
+                s1_test_n, pool, cols,
+                rare_max_df=int(ret.get("rare_token_max_df", 25)),
+                rare_min_len=int(ret.get("rare_token_min_len", 4)))
+            _route_pairs_to_chunks(er, all_s1, tchunk, parts_dir,
+                                   "exact_rare")
+            del er
+            gc.collect()
+        with open(man_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
     # phase 4: union -> candidates TSV -> featurize -> predict -> scored npz
     cand_path = out_dir / "candidate_pairs.tsv"
     if cand_path.exists():

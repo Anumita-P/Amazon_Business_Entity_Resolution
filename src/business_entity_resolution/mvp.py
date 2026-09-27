@@ -182,7 +182,8 @@ class TwoStageRetrieval:
                     out.append((str(query_ids[qi]), self.pool_ids[int(j)]))
             return out
 
-        if n_threads and n_threads > 1 and len(spans) > 1:
+        threaded = bool(n_threads and n_threads > 1 and len(spans) > 1)
+        if threaded:
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
                 parts = list(ex.map(_work, spans))
             rows = [r for part in parts for r in part]
@@ -192,8 +193,10 @@ class TwoStageRetrieval:
                 rows.extend(_work(se))
                 logger.info("  retrieval %d/%d queries (%.0fs)", se[1], n,
                             time.perf_counter() - t0)
-        logger.info("TwoStage query: nq=%d k=%d pairs=%d (%d threads, %.0fs)",
-                    n, k, len(rows), n_threads, time.perf_counter() - t0)
+        logger.info("TwoStage query: nq=%d k=%d pairs=%d (%s, %.0fs)",
+                    n, k, len(rows),
+                    ("%d threads" % n_threads) if threaded else "serial",
+                    time.perf_counter() - t0)
         self.last_query_seconds = time.perf_counter() - t0
         return pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id"])
 
