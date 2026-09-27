@@ -80,7 +80,8 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
-def _retrieve_all(s1_df, pool_df, cols, cfg, rcfg, tag, topk=None):
+def _retrieve_all(s1_df, pool_df, cols, cfg, rcfg, tag, topk=None,
+                  n_threads=1):
     """Two-stage name+addr top-k plus frozen exact nets. Returns (pairs, info)."""
     topk = int(topk or rcfg.get("topk", 50))
     c_id = cols["entity_id"]
@@ -93,7 +94,8 @@ def _retrieve_all(s1_df, pool_df, cols, cfg, rcfg, tag, topk=None):
             max_word_features=int(rcfg.get("max_word_features", 2000000)))
         q = idx.query(s1_df[f"{field}_norm"].astype(str).tolist(), qids, topk,
                       int(rcfg.get("prefilter_min_union", 3000)),
-                      int(rcfg.get("prefilter_max_postings", 300000)))
+                      int(rcfg.get("prefilter_max_postings", 300000)),
+                      n_threads=n_threads)
         parts[field] = q
         info[f"{field}_query_s"] = idx.last_query_seconds
         del idx

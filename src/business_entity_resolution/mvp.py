@@ -153,14 +153,17 @@ class TwoStageRetrieval:
     def query(
         self, query_texts: List[str], query_ids: List[str], k: int,
         prefilter_min_union: int = 3000, prefilter_max_postings: int = 300000,
-        chunk: int = 2000,
+        chunk: int = 2000, n_threads: int = 1,
     ) -> pd.DataFrame:
-        rows: List[Tuple[str, str]] = []
+        """Top-k pairs (PAIRS ONLY). Threaded over query spans; order-stable."""
         qmat_all = self.char_vec.transform(query_texts).astype(np.float32).tocsr()
         n = len(query_texts)
         t0 = time.perf_counter()
-        for s in range(0, n, chunk):
-            e = min(n, s + chunk)
+        spans = [(s, min(n, s + chunk)) for s in range(0, n, chunk)]
+
+        def _work(se: Tuple[int, int]) -> List[Tuple[str, str]]:
+            s, e = se
+            out: List[Tuple[str, str]] = []
             for qi in range(s, e):
                 cand = self._prefilter_rows(query_texts[qi], prefilter_min_union,
                                             prefilter_max_postings)
@@ -170,12 +173,21 @@ class TwoStageRetrieval:
                 take = min(k, len(cand))
                 part = np.argpartition(-sims, take - 1)[:take]
                 for j in cand[part]:
-                    rows.append((str(query_ids[qi]), self.pool_ids[int(j)]))
-            if (s // chunk) % 5 == 0:
-                logger.info("  retrieval %d/%d queries (%.0fs)", e, n,
+                    out.append((str(query_ids[qi]), self.pool_ids[int(j)]))
+            return out
+
+        if n_threads and n_threads > 1 and len(spans) > 1:
+            with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                parts = list(ex.map(_work, spans))
+            rows = [r for part in parts for r in part]
+        else:
+            rows = []
+            for se in spans:
+                rows.extend(_work(se))
+                logger.info("  retrieval %d/%d queries (%.0fs)", se[1], n,
                             time.perf_counter() - t0)
-        logger.info("TwoStage query: nq=%d k=%d pairs=%d (%.0fs)",
-                    n, k, len(rows), time.perf_counter() - t0)
+        logger.info("TwoStage query: nq=%d k=%d pairs=%d (%d threads, %.0fs)",
+                    n, k, len(rows), n_threads, time.perf_counter() - t0)
         self.last_query_seconds = time.perf_counter() - t0
         return pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id"])
 
@@ -184,11 +196,36 @@ class TwoStageRetrieval:
 # fast featurizer (frozen per-pair math, merge join, threaded rows)
 # ---------------------------------------------------------------------------
 
+def _featurize_tuple_block(
+    block: List[Tuple[str, ...]],
+) -> np.ndarray:
+    """Top-level worker (spawn-picklable): tuples -> float32 feature matrix."""
+    out = np.zeros((len(block), len(ALL_FEATURE_COLUMNS)), dtype=np.float32)
+    for i, t in enumerate(block):
+        (a_n, a_a, a_c, b_n, b_a, b_c,
+         a_nn, a_an, b_nn, b_an, cid) = t
+        f = compute_pair_features(a_n, a_a, a_c, b_n, b_a, b_c,
+                                  a_nn, a_an, b_nn, b_an)
+        row = [float(f[c]) for c in FEATURE_COLUMNS]
+        row += [_partial(a_nn, b_nn),
+                float(token_jaccard(a_nn, b_nn)),
+                _partial(a_an, b_an), _wr(a_an, b_an),
+                float(str(cid).startswith("S3-"))]
+        out[i] = row
+    return out
+
+
 def featurize_pairs(
     pairs: pd.DataFrame, s1_df: pd.DataFrame, pool_df: pd.DataFrame,
     cols: Dict[str, str], n_threads: int = 8, chunk_rows: int = 50000,
+    executor: Any = None, proc_task_rows: int = 25000,
 ) -> pd.DataFrame:
-    """Attach ALL_FEATURE_COLUMNS to pairs. Returns pairs + features (+ids)."""
+    """Attach ALL_FEATURE_COLUMNS to pairs. Returns pairs + features (+ids).
+
+    ``executor`` (a process pool) switches the row loop to multiprocess —
+    same numbers, no GIL. Tasks are plain string tuples (small pickles);
+    workers never see the pool frames.
+    """
     c_id, c_name, c_addr, c_cty = (cols["entity_id"], cols["business_name"],
                                   cols["business_address"], cols["country"])
     keep = [c_id, c_name, c_addr, c_cty, "name_norm", "address_norm"]
@@ -232,14 +269,25 @@ def featurize_pairs(
 
     spans = [(s, min(n, s + chunk_rows)) for s in range(0, n, chunk_rows)]
     t0 = time.perf_counter()
-    if n_threads and n_threads > 1 and len(spans) > 1:
+    if executor is not None and n >= proc_task_rows:
+        tuples = list(zip(a_n, a_a, a_c, b_n, b_a, b_c, a_nn, a_an, b_nn,
+                          b_an, cand_ids))
+        tasks = [tuples[i:i + proc_task_rows]
+                 for i in range(0, n, proc_task_rows)]
+        X = np.vstack(list(executor.map(_featurize_tuple_block, tasks)))
+        logger.info("featurized %d pairs (%d procs, %.0fs)", n,
+                    getattr(executor, "_max_workers", "?"),
+                    time.perf_counter() - t0)
+    elif n_threads and n_threads > 1 and len(spans) > 1:
         with ThreadPoolExecutor(max_workers=n_threads) as ex:
             list(ex.map(lambda se: _work(*se), spans))
+        logger.info("featurized %d pairs (%d threads, %.0fs)", n, n_threads,
+                    time.perf_counter() - t0)
     else:
         for s, e in spans:
             _work(s, e)
-    logger.info("featurized %d pairs (%d threads, %.0fs)", n, n_threads,
-                time.perf_counter() - t0)
+        logger.info("featurized %d pairs (serial, %.0fs)", n,
+                    time.perf_counter() - t0)
     feat = pd.DataFrame(X, columns=cols_out)
     out = pd.concat([m[["source1_entity_id", "candidate_entity_id"]].reset_index(drop=True),
                      feat], axis=1)
