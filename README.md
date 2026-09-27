@@ -205,6 +205,9 @@ python scripts/log_experiment.py --rerun EXP-003 --team-member Asha   :: rerun r
   reproduction, EXP-002/003 exact sparse TF-IDF, EXP-004/005 IVF ANN,
   EXP-006 unions + overlap/redundancy. Retrieval-only — no pair features,
   no matcher, no ranking scores.
+- **MVP pipeline** (train → infer → submission):
+  `python scripts/run_mvp.py --mode train --data-root <dataset>` then
+  `--mode infer`. Config: `config/mvp.yaml`; outputs: `output/mvp/`.
 
 ## 12. Intentionally NOT implemented yet (do not jump ahead)
 

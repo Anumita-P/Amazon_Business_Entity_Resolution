@@ -1,0 +1,27 @@
+# MVP pipeline config (NEW file — config/config.yaml stays byte-identical).
+seed: 42
+output_dir: "output/mvp"
+history_path: "logs/mvp_history.jsonl"
+
+train:
+  n_train_anchors: 15000
+  n_valid_anchors: 2000
+  matched_only_train: true
+  include_singletons_valid: true   # validation must measure abstention!
+  neg_ratio: 3                     # negatives per positive (hard from candidates)
+  model: "hgb"                     # hgb | lightgbm | catboost | xgb (falls back to hgb if missing)
+
+retrieval:
+  topk: 50
+  prefilter_min_union: 3000
+  prefilter_max_postings: 300000
+  max_word_features: 2000000
+  include_exact_name: true
+  include_exact_rare: true
+  warn_recall_below: 0.90           # warn if valid-anchor union recall < this
+
+infer:
+  test_chunk: 50000                 # S1 per chunk (bounds RAM)
+  feature_chunk_rows: 200000
+  threads: 8
+  save_scored_chunks: true          # enables free threshold retuning
