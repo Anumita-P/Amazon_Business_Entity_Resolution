@@ -47,6 +47,8 @@ from business_entity_resolution.io import (  # noqa: E402
 from business_entity_resolution.mvp import (  # noqa: E402
     ALL_FEATURE_COLUMNS,
     TwoStageRetrieval,
+    _init_predict_worker,
+    _predict_block,
     build_model,
     entity_scores,
     featurize_pairs,
@@ -263,8 +265,13 @@ def main() -> int:
         logger.info("labeled: pos=%d neg=%d (ratio 1:%.1f)", len(pos_pairs),
                     len(neg_pairs), len(neg_pairs) / max(1, len(pos_pairs)))
         threads = int(icfg.get("threads", 8))
-        fpos = featurize_pairs(pos_pairs, tr_df, pool, cols, threads)
-        fneg = featurize_pairs(neg_pairs, tr_df, pool, cols, threads)
+        pool_by_id = pool.set_index(pool[c_id].astype(str))
+        tr_by_id = tr_df.set_index(tr_df[c_id].astype(str))
+        va_by_id = va_df.set_index(va_df[c_id].astype(str))
+        fpos = featurize_pairs(pos_pairs, tr_df, pool, cols, threads,
+                               s1_by_id=tr_by_id, pool_by_id=pool_by_id)
+        fneg = featurize_pairs(neg_pairs, tr_df, pool, cols, threads,
+                               s1_by_id=tr_by_id, pool_by_id=pool_by_id)
         fpos["label"], fneg["label"] = 1, 0
         train_df = pd.concat([fpos, fneg], ignore_index=True)
         train_df.to_pickle(out_dir / "train_pairs_featurized.pkl")
@@ -288,7 +295,8 @@ def main() -> int:
         joblib.dump(model, out_dir / "model.joblib")
 
         # validate: valid candidates -> features -> scores -> threshold sweep
-        fva = featurize_pairs(va_pairs, va_df, pool, cols, threads)
+        fva = featurize_pairs(va_pairs, va_df, pool, cols, threads,
+                              s1_by_id=va_by_id, pool_by_id=pool_by_id)
         scores = model.predict_proba(
             fva[ALL_FEATURE_COLUMNS].to_numpy(dtype=np.float32))[:, 1]
         scored = pd.DataFrame({"source1_entity_id": fva["source1_entity_id"],
@@ -436,14 +444,22 @@ def main() -> int:
     first = True
     n_cands_total = 0
     fch = int(icfg.get("feature_chunk_rows", 200000))
-    ex = ProcessPoolExecutor(max_workers=n_procs) if n_procs > 0 else None
+    for stale in scored_dir.glob("scored_*.npz"):
+        stale.unlink()  # phase 4 rewrites every chunk; drop partials
+    pool_by_id = pool.set_index(pool[c_id].astype(str))
+    logger.info("infer: pool index built (%d ids)", len(pool_by_id))
+    ex = ProcessPoolExecutor(max_workers=n_procs, initializer=
+                               _init_predict_worker, initargs=(model,)
+                               ) if n_procs > 0 else None
     if ex is not None:
-        logger.info("infer: process-pool featurizer with %d workers", n_procs)
+        logger.info("infer: process pool with %d workers (featurize+predict)",
+                    n_procs)
     try:
         for ci in range(n_chunks):
             cs, ce = ci * tchunk, min(len(all_s1), (ci + 1) * tchunk)
             chunk_ids = all_s1[cs:ce]
             chunk_df = s1_test_n.iloc[cs:ce].reset_index(drop=True)
+            s1_by_id = chunk_df.set_index(chunk_df[c_id].astype(str))
             logger.info("infer chunk %d-%d/%d", cs, ce, len(all_s1))
             frames = [_load_pairs_npz(parts_dir / f"{p}_{ci:04d}.npz")
                       for p in part_prefixes]
@@ -461,9 +477,16 @@ def main() -> int:
             for rs in range(0, len(pairs), fch):
                 sub = pairs.iloc[rs:rs + fch].reset_index(drop=True)
                 fz = featurize_pairs(sub, chunk_df, pool, cols, threads,
-                                     executor=ex, proc_task_rows=proc_rows)
-                pr = model.predict_proba(
-                    fz[ALL_FEATURE_COLUMNS].to_numpy(dtype=np.float32))[:, 1]
+                                     executor=ex, proc_task_rows=proc_rows,
+                                     s1_by_id=s1_by_id,
+                                     pool_by_id=pool_by_id)
+                Xf = fz[ALL_FEATURE_COLUMNS].to_numpy(dtype=np.float32)
+                if ex is not None and len(Xf) >= n_procs * 2:
+                    nt = max(1, min(n_procs * 2, len(Xf)))
+                    pr = np.concatenate(list(ex.map(
+                        _predict_block, np.array_split(Xf, nt))))
+                else:
+                    pr = model.predict_proba(Xf)[:, 1]
                 # compact global S1 positions (int32) instead of id strings
                 gpos = cidx.get_indexer(
                     fz["source1_entity_id"].astype(str)) + cs
@@ -474,7 +497,6 @@ def main() -> int:
                      fz["candidate_entity_id"].astype(str)], dtype=np.int32))
                 sc.append(pr.astype(np.float32))
                 del fz, pr
-                gc.collect()
             if s_ids:
                 np.savez_compressed(
                     scored_dir / f"scored_{cs:07d}_{ce:07d}.npz",

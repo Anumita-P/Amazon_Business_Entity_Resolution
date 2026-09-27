@@ -205,6 +205,21 @@ class TwoStageRetrieval:
 # fast featurizer (frozen per-pair math, merge join, threaded rows)
 # ---------------------------------------------------------------------------
 
+_WORKER_MODEL: Any = None
+
+
+def _init_predict_worker(model: Any) -> None:
+    """Pool initializer: stash the fitted matcher in each worker process."""
+    global _WORKER_MODEL
+    _WORKER_MODEL = model
+
+
+def _predict_block(X: np.ndarray) -> np.ndarray:
+    """Top-level worker (spawn-picklable): float32 rows -> P(match)."""
+    return _WORKER_MODEL.predict_proba(
+        np.ascontiguousarray(X, dtype=np.float32))[:, 1].astype(np.float32)
+
+
 def _featurize_tuple_block(
     block: List[Tuple[str, ...]],
 ) -> np.ndarray:
@@ -228,12 +243,20 @@ def featurize_pairs(
     pairs: pd.DataFrame, s1_df: pd.DataFrame, pool_df: pd.DataFrame,
     cols: Dict[str, str], n_threads: int = 8, chunk_rows: int = 50000,
     executor: Any = None, proc_task_rows: int = 25000,
+    s1_by_id=None, pool_by_id=None,
 ) -> pd.DataFrame:
     """Attach ALL_FEATURE_COLUMNS to pairs. Returns pairs + features (+ids).
 
     ``executor`` (a process pool) switches the row loop to multiprocess —
     same numbers, no GIL. Tasks are plain string tuples (small pickles);
     workers never see the pool frames.
+
+    ``s1_by_id``/``pool_by_id`` are OPTIONAL pre-indexed side tables
+    (entity id as a UNIQUE string index). When given, the per-call merge
+    against the full side table becomes a C-level reindex — same rows,
+    same values (NaN where a key is missing, exactly like left-merge),
+    same order — so a run does ONE 10M-row index build instead of ~900
+    repeated 10M-row hash joins.
     """
     c_id, c_name, c_addr, c_cty = (cols["entity_id"], cols["business_name"],
                                   cols["business_address"], cols["country"])
@@ -241,14 +264,33 @@ def featurize_pairs(
     left = pairs[["source1_entity_id", "candidate_entity_id"]].copy()
     left["source1_entity_id"] = left["source1_entity_id"].astype(str)
     left["candidate_entity_id"] = left["candidate_entity_id"].astype(str)
-    m = left.merge(s1_df[keep].rename(
-        columns={c_id: "source1_entity_id", c_name: "a_name", c_addr: "a_addr",
-                 c_cty: "a_cty", "name_norm": "a_nn", "address_norm": "a_an"}),
-        on="source1_entity_id", how="left")
-    m = m.merge(pool_df[keep].rename(
-        columns={c_id: "candidate_entity_id", c_name: "b_name", c_addr: "b_addr",
-                 c_cty: "b_cty", "name_norm": "b_nn", "address_norm": "b_an"}),
-        on="candidate_entity_id", how="left")
+    if s1_by_id is not None:
+        a = s1_by_id.reindex(left["source1_entity_id"].to_numpy())
+        m = left.copy()
+        m["a_name"] = a[c_name].to_numpy()
+        m["a_addr"] = a[c_addr].to_numpy()
+        m["a_cty"] = a[c_cty].to_numpy()
+        m["a_nn"] = a["name_norm"].to_numpy()
+        m["a_an"] = a["address_norm"].to_numpy()
+    else:
+        m = left.merge(s1_df[keep].rename(
+            columns={c_id: "source1_entity_id", c_name: "a_name",
+                     c_addr: "a_addr", c_cty: "a_cty", "name_norm": "a_nn",
+                     "address_norm": "a_an"}),
+            on="source1_entity_id", how="left")
+    if pool_by_id is not None:
+        b = pool_by_id.reindex(m["candidate_entity_id"].to_numpy())
+        m["b_name"] = b[c_name].to_numpy()
+        m["b_addr"] = b[c_addr].to_numpy()
+        m["b_cty"] = b[c_cty].to_numpy()
+        m["b_nn"] = b["name_norm"].to_numpy()
+        m["b_an"] = b["address_norm"].to_numpy()
+    else:
+        m = m.merge(pool_df[keep].rename(
+            columns={c_id: "candidate_entity_id", c_name: "b_name",
+                     c_addr: "b_addr", c_cty: "b_cty", "name_norm": "b_nn",
+                     "address_norm": "b_an"}),
+            on="candidate_entity_id", how="left")
     m = m.reset_index(drop=True)
     n = len(m)
     cols_out = ALL_FEATURE_COLUMNS
