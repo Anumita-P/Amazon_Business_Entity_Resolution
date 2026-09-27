@@ -260,13 +260,14 @@ def main() -> int:
                        "macro_f05": float(best["macro_f05"]),
                        "macro_precision": float(best["macro_precision"]),
                        "macro_recall": float(best["macro_recall"])}, fh, indent=2)
-        _history(cfg.logs_dir, {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "mode": "train", "git_commit": git_commit, "seed": seed,
-            "retrieval_recall": rec, "retrieval_burden": bur,
-            "n_train_pairs": len(train_df), "model": model_name,
-            "best_threshold": float(best["threshold"]),
-            "macro_f05": float(best["macro_f05"])})
+        if not args.no_log:
+            _history(cfg.logs_dir, {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "mode": "train", "git_commit": git_commit, "seed": seed,
+                "retrieval_recall": rec, "retrieval_burden": bur,
+                "n_train_pairs": len(train_df), "model": model_name,
+                "best_threshold": float(best["threshold"]),
+                "macro_f05": float(best["macro_f05"])})
         _log("MVP train: twostage retrieval + 35 feats + " + model_name,
              "MVP pipeline reaches competitive local macro-F0.5.",
              "mvp-twostage-v1", "mvp-feats-v1", model_name,
@@ -369,11 +370,12 @@ def main() -> int:
         return 3
     logger.info("submission VALID: %s + %s", out_dir / "matching_results.tsv",
                 cand_path)
-    _history(cfg.logs_dir, {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "mode": "infer", "git_commit": git_commit, "threshold": thr,
-        "n_test_s1": len(all_s1), "n_candidate_pairs": len(cands),
-        "n_predicted_nonempty": n_pred})
+    if not args.no_log:
+        _history(cfg.logs_dir, {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "infer", "git_commit": git_commit, "threshold": thr,
+            "n_test_s1": len(all_s1), "n_candidate_pairs": len(cands),
+            "n_predicted_nonempty": n_pred})
     _log("MVP infer: submission at threshold %.3f" % thr,
          "First leaderboard submission.", "mvp-twostage-v1", "mvp-feats-v1",
          "see-train-row", "threshold=%.3f" % thr, thr, None, None, None,
